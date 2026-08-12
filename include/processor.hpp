@@ -212,6 +212,19 @@ private:
 
     // Input frame map for frame reuse: sample span and byte range of every
     // frame in the input file, recorded during decode (reuse_frames only).
+public:
+    /// What a worker records per frame; merged into InputFrame after the join.
+    /// Public only because the decode workers keep it in a file-scope
+    /// thread_local -- one per worker, since byte offsets chain within a single
+    /// decoder and cannot be placed by sample position the way the PCM can.
+    struct PendingFrameRec {
+        uint64_t first_sample;
+        uint32_t block_size;
+        uint64_t byte_start;
+        uint64_t byte_end;
+    };
+
+private:
     struct InputFrame {
         uint64_t first_sample;
         uint32_t block_size;
@@ -220,6 +233,9 @@ private:
     };
     std::vector<InputFrame> m_input_frames;
     uint64_t m_prev_frame_end = 0;   // rolling byte offset during decode
+    /// STREAMINFO's max blocksize, used to align parallel-decode ranges onto
+    /// frame boundaries so a worker's first frame is usually its own.
+    uint32_t m_max_blocksize = 0;
     bool     m_frame_pos_ok   = true; // false if the decoder can't report positions
 
     // --- streaming decode, used by -P only ----
@@ -245,6 +261,27 @@ private:
     /// Mark range `idx` complete and push m_decoded as far as the contiguous
     /// prefix now reaches. Takes m_decode_mu.
     void advance_decoded(size_t idx);
+
+    /// Decode the whole stream with `nthr` workers into preallocated m_pcm_data,
+    /// each seeking to its own block-aligned range. Used by both -P (which also
+    /// consumes m_decoded as it fills) and the CPU path (which just waits).
+    ///
+    /// `first` is an already-initialised decoder positioned past the metadata;
+    /// worker 0 reuses it, since it starts at sample 0 and needs no seek. The
+    /// caller owns and deletes it.
+    ///
+    /// Collects the frame byte-range map when reuse is enabled, merging the
+    /// per-worker records afterwards; sets m_frame_pos_ok false if any worker
+    /// could not report positions or the merged map does not tile the stream.
+    bool decode_parallel(FLAC__StreamDecoder* first, unsigned nthr,
+                         uint64_t range_len);
+
+    /// Threads per parallel decode: half the cores, capped, overridable with
+    /// FLACOUT_DECODE_THREADS. 1 disables the parallel path entirely.
+    unsigned decode_thread_count(uint64_t total_samples, uint64_t align) const;
+
+    /// Merge and validate what the workers recorded; see decode_parallel().
+    void merge_input_frames(std::vector<std::vector<PendingFrameRec>>& per_worker);
     std::atomic<bool>     m_decode_done{false};
     std::atomic<bool>     m_decode_failed{false};
     std::mutex              m_decode_mu;

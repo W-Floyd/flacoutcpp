@@ -29,6 +29,20 @@ static thread_local uint64_t t_range_hi = UINT64_MAX;
 /// has covered its range.
 static thread_local uint64_t t_frame_end = 0;
 
+// Frame-reuse bookkeeping under a *parallel* decode. Each worker records the
+// frames it decodes with their byte ranges; the ranges are merged, sorted and
+// deduplicated once every worker has joined. Boundary frames get decoded by two
+// workers (a seek lands on the frame *containing* the target, and each worker
+// runs until it passes its end), so the duplicates are exact and dropping either
+// copy is the same thing.
+static thread_local std::vector<Processor::PendingFrameRec> t_frames;
+/// Byte offset just past the previous frame this worker decoded; seeded from the
+/// decoder's position right after the seek.
+static thread_local uint64_t t_prev_end = 0;
+/// Cleared per worker: a position query that fails once makes the whole map
+/// unusable, and the merge must see that.
+static thread_local bool t_pos_ok = true;
+
 // ============================================================
 // Constructor / destructor
 // ============================================================
@@ -139,14 +153,42 @@ bool Processor::process() {
     }
 
     // For frame reuse we need each input frame's byte range. Decode metadata
-    // first so the position query below lands on the first audio frame.
-    bool ok = true;
-    if (m_config.reuse_frames) {
-        ok = FLAC__stream_decoder_process_until_end_of_metadata(decoder);
-        if (ok && !FLAC__stream_decoder_get_decode_position(decoder, &m_prev_frame_end))
-            m_frame_pos_ok = false;
+    // first so the position query below lands on the first audio frame -- and,
+    // for the parallel path, so STREAMINFO's sample count is known before the
+    // buffers are sized.
+    bool ok = FLAC__stream_decoder_process_until_end_of_metadata(decoder);
+    if (ok && m_config.reuse_frames &&
+        !FLAC__stream_decoder_get_decode_position(decoder, &m_prev_frame_end))
+        m_frame_pos_ok = false;
+
+    // Parallel decode, ported from -P. libFLAC is single-threaded and its decode
+    // is a fixed cost the search cannot hide: measured at 0.24 s of a 1.05 s run
+    // on a 4.7-minute track at the leanest search settings, i.e. a quarter of it,
+    // against 0.024 s for eight workers.
+    //
+    // Frames are independent once you know where they start, and a seek is how a
+    // worker finds out. Needs a sample count to size the buffers, so a STREAMINFO
+    // without one keeps the serial path -- as do short files, where the seeks and
+    // the extra decoder instances cost more than they save.
+    const uint64_t align = (m_max_blocksize > 0) ? m_max_blocksize : 4096;
+    unsigned nthr = ok && m_total_samples > 0
+                  ? decode_thread_count(m_total_samples, align) : 1;
+    if (nthr > 1) {
+        m_pcm_data.assign(m_channels, std::vector<int32_t>());
+        for (auto& ch : m_pcm_data) ch.resize((size_t)m_total_samples);
+        m_stream_mode = true;
+        m_decoded.store(0, std::memory_order_relaxed);
+        m_decode_done.store(false, std::memory_order_relaxed);
+        m_decode_failed.store(false, std::memory_order_relaxed);
+
+        uint64_t rlen = (m_total_samples + nthr - 1) / nthr;
+        rlen = ((rlen + align - 1) / align) * align;
+        nthr = (unsigned)((m_total_samples + rlen - 1) / rlen);
+        ok = decode_parallel(decoder, nthr, rlen);
+        m_stream_mode = false;
+    } else {
+        ok = ok && FLAC__stream_decoder_process_until_end_of_stream(decoder);
     }
-    ok = ok && FLAC__stream_decoder_process_until_end_of_stream(decoder);
     FLAC__stream_decoder_delete(decoder);
 
     if (!ok || m_pcm_data.empty() || m_total_samples == 0) return false;
@@ -156,21 +198,53 @@ bool Processor::process() {
                   << m_channels << " ch, " << m_bps << " bps, "
                   << m_sample_rate << " Hz)\n";
 
-    // --- Step 2b: compute MD5 over interleaved little-endian PCM ----
+    // --- Step 2b: MD5 over interleaved little-endian PCM, on its own thread ----
+    //
     // The FLAC spec mandates MD5 over the raw audio (channel-interleaved,
-    // little-endian, ceil(bps/8) bytes per sample).
+    // little-endian, ceil(bps/8) bytes per sample). Nothing downstream needs the
+    // digest until STREAMINFO is patched at the very end, and the hash depends
+    // only on the decoded samples -- which the optimiser only reads. So it runs
+    // beside the search instead of in front of it.
+    //
+    // Two changes, both ported from -P, where they were worth 0.221 -> 0.170 s:
+    //
+    //  - **Batched.** update() was being called once per *sample* with a 4-6 byte
+    //    buffer, which is mostly call overhead; 4096 samples per call is not.
+    //  - **Threaded.** MD5 is compute-bound at a few hundred MB/s and cannot be
+    //    parallelised internally (it chains 64-byte blocks with no combine
+    //    operator), so the only way to hide it is to overlap it with something
+    //    else. Here that is the whole search.
+    //
+    // It costs one thread against the optimiser's pool for ~100 ms on a 5-minute
+    // track, and buys all of it back on any configuration where the search is
+    // shorter than the hash.
     const int bytes_per_sample = (m_bps + 7) / 8;
     detail::MD5 md5;
-    std::vector<uint8_t> pcm_bytes(m_channels * bytes_per_sample);
-    for (uint64_t s = 0; s < m_total_samples; ++s) {
-        for (uint32_t c = 0; c < m_channels; ++c) {
-            int32_t v = m_pcm_data[c][s];
-            for (int b = 0; b < bytes_per_sample; ++b)
-                pcm_bytes[c * bytes_per_sample + b] = (uint8_t)(v >> (b * 8));
+    // Joined by the guard below on *every* exit from here on. Without it an early
+    // `return false` (a failed optimise, a failed open) would run ~std::thread on
+    // a joinable thread, which is std::terminate rather than an error path.
+    struct Joiner {
+        std::thread& t;
+        ~Joiner() { if (t.joinable()) t.join(); }
+    };
+    std::thread md5_thread([this, bytes_per_sample, &md5]() {
+        const uint32_t stride = m_channels * (uint32_t)bytes_per_sample;
+        constexpr uint64_t BATCH = 4096;
+        std::vector<uint8_t> buf((size_t)BATCH * stride);
+        for (uint64_t at = 0; at < m_total_samples; ) {
+            const uint64_t n = std::min<uint64_t>(BATCH, m_total_samples - at);
+            uint8_t* w = buf.data();
+            for (uint64_t i = 0; i < n; ++i)
+                for (uint32_t c = 0; c < m_channels; ++c) {
+                    const int32_t v = m_pcm_data[c][at + i];
+                    for (int b = 0; b < bytes_per_sample; ++b)
+                        *w++ = (uint8_t)(v >> (b * 8));
+                }
+            md5.update(buf.data(), (size_t)n * stride);
+            at += n;
         }
-        md5.update(pcm_bytes.data(), m_channels * bytes_per_sample);
-    }
-    auto md5_digest = md5.digest();
+    });
+    Joiner md5_joiner{md5_thread};
 
     // --- Step 2c: frame-reuse preparation ----
     // Validate that the recorded input frames tile the stream and load the
@@ -378,6 +452,12 @@ bool Processor::process() {
         }
     }
 
+    // The hash has been running beside the search; this is the first point that
+    // needs its result. (The guard would join at scope exit anyway, but the
+    // digest cannot be read before the thread is done.)
+    if (md5_thread.joinable()) md5_thread.join();
+    const auto md5_digest = md5.digest();
+
     // --- Step 6: seek back and update STREAMINFO with frame sizes + MD5 ----
     // Block sizes come from the emitted frames — with reuse they can differ
     // from the DP's blocks.
@@ -520,6 +600,137 @@ bool Processor::process() {
 // ============================================================
 // The -P pipeline
 // ============================================================
+
+unsigned Processor::decode_thread_count(uint64_t total_samples, uint64_t align) const
+{
+    unsigned n = std::thread::hardware_concurrency();
+    n = std::max(1u, std::min(n ? n / 2 : 1u, 8u));
+    if (const char* e = std::getenv("FLACOUT_DECODE_THREADS"))
+        n = (unsigned)std::max(1, std::min(32, atoi(e)));
+    // Below a few ranges the seeks and extra decoder instances cost more than
+    // they save, and a range shorter than one frame cannot be split at all.
+    if (align == 0 || total_samples < 4 * align) n = 1;
+    return n;
+}
+
+void Processor::merge_input_frames(std::vector<std::vector<PendingFrameRec>>& per_worker)
+{
+    m_input_frames.clear();
+    std::vector<PendingFrameRec> all;
+    for (auto& v : per_worker) {
+        if (v.empty() && !m_frame_pos_ok) return;
+        all.insert(all.end(), v.begin(), v.end());
+    }
+    std::sort(all.begin(), all.end(),
+              [](const PendingFrameRec& a, const PendingFrameRec& b) {
+                  return a.first_sample < b.first_sample;
+              });
+    // Boundary frames are decoded twice, identically; keep one.
+    uint64_t expect = 0;
+    for (const auto& f : all) {
+        if (!m_input_frames.empty() &&
+            f.first_sample == m_input_frames.back().first_sample) continue;
+        if (f.first_sample != expect || f.byte_end <= f.byte_start) {
+            m_frame_pos_ok = false;
+            m_input_frames.clear();
+            return;
+        }
+        m_input_frames.push_back(InputFrame{f.first_sample, f.block_size,
+                                            f.byte_start, f.byte_end});
+        expect += f.block_size;
+    }
+    if (expect != m_total_samples) { m_frame_pos_ok = false; m_input_frames.clear(); }
+}
+
+bool Processor::decode_parallel(FLAC__StreamDecoder* first, unsigned nthr,
+                                uint64_t range_len)
+{
+    m_range_len = range_len;
+    m_range_done.assign(nthr, 0);
+
+    std::vector<std::vector<PendingFrameRec>> per_worker(nthr);
+    std::vector<uint8_t> pos_ok(nthr, 1);
+    std::vector<std::thread> workers;
+    std::atomic<unsigned> live{nthr};
+
+    for (unsigned i = 0; i < nthr; ++i) {
+        workers.emplace_back([this, i, range_len, first, &live, &per_worker, &pos_ok]() {
+            const uint64_t lo = (uint64_t)i * range_len;
+            const uint64_t hi = std::min(lo + range_len, m_total_samples);
+            t_range_lo = lo;
+            t_range_hi = hi;
+            t_frames.clear();
+            t_pos_ok = m_config.reuse_frames;
+            t_prev_end = 0;
+
+            auto fail = [&]() {
+                m_decode_failed.store(true, std::memory_order_release);
+                m_decode_cv.notify_all();
+                if (--live == 0) {
+                    m_decode_done.store(true, std::memory_order_release);
+                    m_decode_cv.notify_all();
+                }
+            };
+
+            FLAC__StreamDecoder* d = first;
+            bool own = false;
+            if (i != 0) {
+                d = FLAC__stream_decoder_new();
+                if (!d || FLAC__stream_decoder_init_file(
+                              d, m_input.c_str(), write_callback, nullptr,
+                              error_callback, this)
+                          != FLAC__STREAM_DECODER_INIT_STATUS_OK) {
+                    if (d) FLAC__stream_decoder_delete(d);
+                    fail();
+                    return;
+                }
+                own = true;
+                if (!FLAC__stream_decoder_seek_absolute(d, lo)) {
+                    FLAC__stream_decoder_delete(d);
+                    fail();
+                    return;
+                }
+            }
+            // The byte offset the first frame starts at: after the seek for a
+            // worker that seeked, after the metadata for worker 0 (which the
+            // caller has already positioned).
+            if (t_pos_ok && !FLAC__stream_decoder_get_decode_position(d, &t_prev_end))
+                t_pos_ok = false;
+
+            bool ok = true;
+            for (;;) {
+                const FLAC__StreamDecoderState st = FLAC__stream_decoder_get_state(d);
+                if (st == FLAC__STREAM_DECODER_END_OF_STREAM) break;
+                if (st == FLAC__STREAM_DECODER_ABORTED ||
+                    st == FLAC__STREAM_DECODER_OGG_ERROR ||
+                    st == FLAC__STREAM_DECODER_SEEK_ERROR ||
+                    st == FLAC__STREAM_DECODER_MEMORY_ALLOCATION_ERROR) { ok = false; break; }
+                if (!FLAC__stream_decoder_process_single(d)) { ok = false; break; }
+                if (t_frame_end >= hi) break;
+            }
+            if (own) FLAC__stream_decoder_delete(d);
+            if (!ok) m_decode_failed.store(true, std::memory_order_release);
+
+            per_worker[i] = std::move(t_frames);
+            pos_ok[i] = t_pos_ok ? 1 : 0;
+
+            advance_decoded(i);
+            if (--live == 0) {
+                m_decode_done.store(true, std::memory_order_release);
+                m_decode_cv.notify_all();
+            }
+        });
+    }
+    for (auto& t : workers) if (t.joinable()) t.join();
+
+    if (m_config.reuse_frames) {
+        for (unsigned i = 0; i < nthr; ++i)
+            if (!pos_ok[i]) { m_frame_pos_ok = false; break; }
+        if (m_frame_pos_ok) merge_input_frames(per_worker);
+        else                m_input_frames.clear();
+    }
+    return !m_decode_failed.load(std::memory_order_acquire);
+}
 
 void Processor::advance_decoded(size_t idx)
 {
@@ -896,6 +1107,20 @@ FLAC__StreamDecoderWriteStatus Processor::write_callback(
                             buffer[c] + (lo - at),
                             (size_t)(hi - lo) * sizeof(int32_t));
 
+        // Reuse needs every input frame's byte range. Recorded per worker and
+        // merged after the join -- unlike the sample data, this cannot be placed
+        // by position, because the byte offsets only chain within one decoder.
+        if (self->m_config.reuse_frames && t_pos_ok) {
+            uint64_t end = 0;
+            if (FLAC__stream_decoder_get_decode_position(decoder, &end)) {
+                t_frames.push_back(Processor::PendingFrameRec{at, bsize, t_prev_end, end});
+                t_prev_end = end;
+            } else {
+                t_pos_ok = false;
+                t_frames.clear();
+            }
+        }
+
         return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
     }
 
@@ -941,6 +1166,7 @@ void Processor::metadata_callback(
         self->m_channels      = metadata->data.stream_info.channels;
         self->m_bps           = metadata->data.stream_info.bits_per_sample;
         self->m_total_samples = metadata->data.stream_info.total_samples;
+        self->m_max_blocksize = metadata->data.stream_info.max_blocksize;
     }
 }
 
