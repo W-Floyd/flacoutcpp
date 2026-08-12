@@ -41,7 +41,9 @@ public:
     GpuEvaluator(const GpuEvaluator&)            = delete;
     GpuEvaluator& operator=(const GpuEvaluator&) = delete;
 
-    /// True when a device was brought up and evaluate() can be called.
+    /// True when a device was brought up and evaluate() can be called. Can go
+    /// false mid-run: a lost device (suspend/resume, driver reset, TDR) disables
+    /// the path permanently and the encode finishes on the CPU.
     bool available() const;
 
     /// Human-readable reason available() is false, or the device description
@@ -106,10 +108,41 @@ public:
     void set_slots(int n);
     int  slots() const;
 
-    /// Percentage of offered subframes the GPU accepts (1..100). Below 100
-    /// hands work back to the CPU; see the note on the throttle in gpu.cpp.
+    /**
+     * @brief Percentage of offered subframes the GPU accepts (1..100), or 0 for
+     *        the adaptive throttle.
+     *
+     * 0 (the default) compares measured device throughput against measured
+     * single-thread CPU throughput and accepts only while the device is winning
+     * — see note_cpu() and the throttle note in gpu.cpp. A fixed 1..100 pins the
+     * share instead and disables adaptation, which is what an A/B of the
+     * throttle itself needs.
+     */
     void set_duty(int pct);
     int  duty() const;
+
+    /**
+     * @brief Report what the CPU path cost for a batch the GPU did not take.
+     *
+     * The adaptive throttle needs both sides of the comparison, and only the
+     * caller can measure the CPU side. Costs are in multiply-accumulates, the
+     * same unit macs() reports, so batches of different block size and order are
+     * comparable.
+     *
+     * Cheap and lock-free; safe to call from every worker. Ignored when duty is
+     * pinned.
+     */
+    void note_cpu(uint64_t macs, double seconds);
+
+    /// True when the adaptive throttle shut the device down because it was
+    /// decisively slower than the host, as opposed to the device being lost or
+    /// never coming up. Distinguishes the two in reporting.
+    bool gave_up() const;
+
+    /// Device and single-thread CPU throughput as the throttle currently sees
+    /// them, in MACs/second, plus the share of offers accepted. Zero where not
+    /// yet measured. For `-G` reporting.
+    void throttle_stats(double* gpu_mps, double* cpu_mps, double* accept) const;
 
     /**
      * @brief Cheap advisory check: would a batch be accepted right now?

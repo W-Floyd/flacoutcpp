@@ -90,6 +90,57 @@ if(FLACOUT_VULKAN)
                 "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spv.cmake"
         COMMENT "Compiling and embedding shaders/sweep.comp"
         VERBATIM)
+
+    # Fallback variants of the same source for devices missing subgroup
+    # ARITHMETIC, shaderInt64, or both (old Intel iGPUs under Mesa hasvk miss
+    # both). One module per combination, so a device pays only for the feature it
+    # actually lacks; src/gpu.cpp picks at device-init time. The default variant
+    # above is untouched, so a capable GPU runs exactly the SPIR-V it ran before
+    # these existed -- verified by comparing sweep.spv across the change.
+    # name:defines:symbol, defines comma-separated -- a ';' here would be a list
+    # separator and split the entry in two, which is exactly the bug this comment
+    # is standing in for.
+    set(SWEEP_VARIANTS
+        "noarith:SWEEP_NO_ARITH:kSweepNoArithSpv"
+        "noint64:SWEEP_NO_INT64:kSweepNoInt64Spv"
+        "compat:SWEEP_NO_ARITH,SWEEP_NO_INT64:kSweepCompatSpv"
+        "slm:SWEEP_SLM_STATE:kSweepSlmSpv"
+        "compat_slm:SWEEP_NO_ARITH,SWEEP_NO_INT64,SWEEP_SLM_STATE:kSweepCompatSlmSpv")
+    set(SWEEP_VAR_HDRS)
+    foreach(_v ${SWEEP_VARIANTS})
+        string(REPLACE ":" ";" _vparts "${_v}")
+        list(GET _vparts 0 _vname)
+        list(GET _vparts 1 _vdefstr)
+        list(GET _vparts 2 _vsym)
+        string(REPLACE "," ";" _vdefs "${_vdefstr}")
+        set(_vspv "${CMAKE_CURRENT_BINARY_DIR}/sweep_${_vname}.spv")
+        set(_vhdr "${CMAKE_CURRENT_BINARY_DIR}/generated/sweep_${_vname}_spv.h")
+        set(_vflags)
+        foreach(_d ${_vdefs})
+            list(APPEND _vflags "-D${_d}")
+        endforeach()
+        if(FLACOUT_GLSLC)
+            set(_vcmd ${FLACOUT_GLSLC} -O --target-env=vulkan1.1 ${_vflags}
+                -fshader-stage=compute "${CMAKE_CURRENT_SOURCE_DIR}/shaders/sweep.comp"
+                -o "${_vspv}")
+        else()
+            set(_vcmd ${FLACOUT_GLSLANG} -V --target-env vulkan1.1 -S comp ${_vflags}
+                "${CMAKE_CURRENT_SOURCE_DIR}/shaders/sweep.comp" -o "${_vspv}")
+        endif()
+        add_custom_command(
+            OUTPUT "${_vhdr}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+            COMMAND ${_vcmd}
+            COMMAND ${CMAKE_COMMAND}
+                    -DSPV=${_vspv} -DHDR=${_vhdr}
+                    -DSYM=${_vsym} -DSRC=shaders/sweep.comp
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spv.cmake"
+            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/sweep.comp"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spv.cmake"
+            COMMENT "Compiling and embedding shaders/sweep.comp (${_vdefs})"
+            VERBATIM)
+        list(APPEND SWEEP_VAR_HDRS "${_vhdr}")
+    endforeach()
     # Pure-GPU pipeline (-P): one kernel per stage, each embedded the same way.
     # Names map mechanically: shaders/pg_foo.comp -> pg_foo_spv.h -> kPgFooSpv.
     set(PG_SHADERS prepare autoc levinson quant fixed sweep
@@ -152,7 +203,8 @@ if(FLACOUT_VULKAN)
         VERBATIM)
     list(APPEND PG_HDRS "${_ahdr}")
 
-    add_custom_target(flacout_shaders DEPENDS "${SWEEP_HDR}" ${PG_HDRS})
+    add_custom_target(flacout_shaders
+        DEPENDS "${SWEEP_HDR}" ${SWEEP_VAR_HDRS} ${PG_HDRS})
     add_dependencies(flacout_lib flacout_shaders)
 
     target_include_directories(flacout_lib PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")

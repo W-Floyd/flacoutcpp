@@ -233,11 +233,29 @@ struct Config {
      */
     unsigned gpu_partition_cap = 8;
 
-    /// Dispatches in flight (`--gpu-slots`, 1-16). See GpuEvaluator::set_slots.
-    unsigned gpu_slots = 3;
+    /**
+     * @brief Dispatches in flight (`--gpu-slots`, 1-16).
+     *
+     * 0 = auto, which is 3 on a device running the fast kernel and **1** on a
+     * constrained one. Each slot parks a CPU worker on a fence, so a device
+     * slower than the host turns extra slots into idle cores: on a Haswell iGPU
+     * three slots cost 3.7x against one, at 8 CPU threads.
+     *
+     * See GpuEvaluator::set_slots.
+     */
+    unsigned gpu_slots = 0;
 
-    /// Percent of subframes the GPU accepts (`--gpu-duty`, 1-100).
-    unsigned gpu_duty = 100;
+    /**
+     * @brief Percent of subframes the GPU accepts (`--gpu-duty`, 1-100), or 0
+     *        for the adaptive throttle.
+     *
+     * 0 (the default) lets GpuEvaluator compare its own measured throughput
+     * against one CPU thread's and take work only while it is winning. No fixed
+     * share can be right: measured, the best value moves with the device (a
+     * Haswell iGPU wants almost none, a Tesla P4 wants all of it) and even with
+     * the bit depth of the input on one device.
+     */
+    unsigned gpu_duty = 0;
 
     /**
      * @brief Fully GPU-resident encoder (`-P`). A different encoder, not a
@@ -255,7 +273,9 @@ struct Config {
      */
     bool pure_gpu = false;
 
-    /// Fixed frame size for `-P`. Multiple of 256, at most 4096.
+    /// Fixed frame size for `-P`. Multiple of 256, in [256, 16384] — the 4096 cap
+    /// this comment used to state was lifted; 4096 is still the default because it
+    /// measured best on real music.
     uint32_t pg_block_size = 4096;
 
     /// LPC precisions swept per (window, order) under `-P`. Empty → {15}.

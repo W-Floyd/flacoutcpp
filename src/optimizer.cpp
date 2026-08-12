@@ -1363,9 +1363,18 @@ static double window_zero_frac(WindowType wt, uint32_t N)
 // happens to interleave with CPU encode time, not on anything configured.
 void Optimizer::report_gpu(uint64_t total_candidates) const
 {
-    if (!m_gpu || !m_gpu->available() || !m_verbose) return;
+    if (!m_gpu || !m_verbose) return;
     uint64_t gc = 0; double gs = 0.0;
     m_gpu->stats(&gc, &gs);
+    // Not gated on available(): a device that was lost mid-encode still did
+    // work, and its absence at the end is the single most useful thing to say
+    // about a run that suddenly got slower.
+    if (!m_gpu->available())
+        std::cout << (m_gpu->gave_up()
+                          ? "GPU: throttle switched the encode to the CPU; the "
+                            "device was slower than the host\n"
+                          : "GPU: device was lost during the encode; the rest "
+                            "ran on the CPU\n");
     if (!gc) { std::cout << "GPU: no batches dispatched\n"; return; }
     // Candidates per second is the portable figure: it does not depend on the
     // fixture's length or on how the CPU/GPU split happened to fall, so it is
@@ -1383,6 +1392,20 @@ void Optimizer::report_gpu(uint64_t total_candidates) const
     std::snprintf(buf, sizeof buf, "GPU: %llu MACs\n",
                   (unsigned long long)m_gpu->macs());
     std::cout << buf;
+    // What the throttle decided and why. Printing the two rates it compared is
+    // the only way to tell "the device was declined because it is slower" from
+    // "the device was declined because of a bug in the throttle", and the ratio
+    // is the number to quote when reporting a device's usefulness.
+    double gmps = 0.0, cmps = 0.0, acc = 0.0;
+    m_gpu->throttle_stats(&gmps, &cmps, &acc);
+    if (gmps > 0.0 || cmps > 0.0) {
+        std::snprintf(buf, sizeof buf,
+                      "GPU: throttle %s -- device %.3g vs one CPU thread %.3g "
+                      "MACs/s (%.2fx), accepted %.0f%% of offers\n",
+                      m_gpu->duty() ? "pinned" : "adaptive",
+                      gmps, cmps, cmps > 0.0 ? gmps / cmps : 0.0, acc * 100.0);
+        std::cout << buf;
+    }
     (void)total_candidates;
 }
 
@@ -2873,6 +2896,41 @@ SubframeParams Optimizer::optimize_subframe(
         };
 
         bool gpu_done = false;
+        // One timed CPU candidate per subframe, which is what the adaptive
+        // throttle compares the device against (GpuEvaluator::note_cpu). It has
+        // to be measured here rather than modelled: the rate that matters is one
+        // worker thread's, under whatever load the rest of the pool is putting on
+        // the machine right now, and that is not knowable from device properties.
+        //
+        // One sample per subframe, not per candidate, so the clock pair is noise
+        // next to the candidate it times; and none of it is compiled unless
+        // Vulkan is, nor entered unless a device came up.
+#ifdef FLACOUT_HAVE_VULKAN
+        bool cpu_timed = !(gpu && gpu->available());
+#else
+        bool cpu_timed = true;
+#endif
+        auto eval_candidate_timed = [&](const float* lpc, int ord,
+                                        WindowType wt) -> uint32_t {
+            if (cpu_timed) return eval_candidate(lpc, ord, wt);
+            cpu_timed = true;
+#ifdef FLACOUT_HAVE_VULKAN
+            const auto t0 = std::chrono::steady_clock::now();
+            const uint32_t r = eval_candidate(lpc, ord, wt);
+            const double dt =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+                    .count();
+            // eval_candidate covers the whole precision ladder for one (window,
+            // order), where a GPU candidate is one (window, order, precision) --
+            // so scale to the same nominal MAC count the device reports.
+            gpu->note_cpu((uint64_t)(bsize - (uint32_t)ord) * (uint64_t)ord *
+                              (uint64_t)precisions.size(), dt);
+            return r;
+#else
+            return eval_candidate(lpc, ord, wt);
+#endif
+        };
+
 #ifdef FLACOUT_HAVE_VULKAN
         // ---- GPU: one batch per subframe (-G) ----
         //
@@ -2950,7 +3008,7 @@ SubframeParams Optimizer::optimize_subframe(
                         INSTR(g_instr.order_pruned_break.fetch_add(max_order - ord + 1, std::memory_order_relaxed));
                         break;
                     }
-                    eval_candidate(all_lpc[ord - 1], ord, wt);
+                    eval_candidate_timed(all_lpc[ord - 1], ord, wt);
                 }
             }
         } else if (!gpu_done) {
@@ -3261,7 +3319,7 @@ SubframeParams Optimizer::optimize_subframe(
 #ifdef FLACOUT_HAVE_VULKAN
                     if (gpu_ranked && c < gcost.size()) cc = eval_ranked_gpu(c); else
 #endif
-                    cc = eval_candidate(
+                    cc = eval_candidate_timed(
                         &lpc_store[cd.wi * LPC_STRIDE + (size_t)(cd.ord - 1) * 32],
                         cd.ord, windows[cd.wi]);
 #ifdef FLACOUT_DUMP_CANDIDATES
@@ -3297,7 +3355,7 @@ SubframeParams Optimizer::optimize_subframe(
 #ifdef FLACOUT_HAVE_VULKAN
                 if (gpu_ranked && c < gcost.size()) cc = eval_ranked_gpu(c); else
 #endif
-                cc = eval_candidate(
+                cc = eval_candidate_timed(
                     &lpc_store[cd.wi * LPC_STRIDE + (size_t)(cd.ord - 1) * 32],
                     cd.ord, windows[cd.wi]);
 #ifdef FLACOUT_DUMP_CANDIDATES

@@ -1,9 +1,31 @@
 #version 450
 #extension GL_KHR_shader_subgroup_basic            : require
 #extension GL_KHR_shader_subgroup_ballot           : require
-#extension GL_KHR_shader_subgroup_arithmetic       : require
 #extension GL_KHR_shader_subgroup_shuffle_relative : require
+// Two independent fallbacks for constrained devices, each emulating one feature
+// this kernel would otherwise require, from operations old hardware does have:
+//
+//   SWEEP_NO_ARITH  subgroupMin/Max from subgroupShuffleXor
+//   SWEEP_NO_INT64  the residual dot product from imulExtended/uaddCarry
+//
+// Mesa hasvk on Haswell (Gen7.5) needs both; they are separate defines so a
+// device missing only one pays only for that one, and so their costs can be
+// measured apart (FLACOUT_GPU_COMPAT forces a variant on any device).
+//
+// Every variant is compiled from this same source, so there is exactly one
+// algorithm to keep in step with Optimizer::calculate_rice_cost, and the
+// emulations are exact rather than approximate -- the cost this kernel returns
+// has to stay the CPU's to the bit. A fully-featured device compiles the #else
+// sides, whose SPIR-V is byte-identical to before any of this existed: capable
+// parts pay nothing for it, not one instruction.
+#ifdef SWEEP_NO_ARITH
+#extension GL_KHR_shader_subgroup_shuffle          : require
+#else
+#extension GL_KHR_shader_subgroup_arithmetic       : require
+#endif
+#ifndef SWEEP_NO_INT64
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#endif
 //
 // GPU candidate evaluation for Optimizer::optimize_subframe.
 //
@@ -84,8 +106,87 @@ uint satadd(uint a, uint b) {
     return (a > 0xFFFFFFFFu - b) ? 0xFFFFFFFFu : a + b;
 }
 
+#ifdef SWEEP_NO_ARITH
+// subgroupMin/Max from subgroupShuffleXor: the standard butterfly, log2(32) = 5
+// steps, every lane ending with the reduction over the whole subgroup. Valid
+// only because the call sites are subgroup-uniform and the dispatch is pinned
+// to full 32-lane subgroups -- an inactive lane would contribute garbage, where
+// the real subgroupMin ignores it.
+uint sgMinCompat(uint v) {
+    for (uint s = 1u; s < uint(SG); s <<= 1) v = min(v, subgroupShuffleXor(v, s));
+    return v;
+}
+uint sgMaxCompat(uint v) {
+    for (uint s = 1u; s < uint(SG); s <<= 1) v = max(v, subgroupShuffleXor(v, s));
+    return v;
+}
+#define SGMIN(x) sgMinCompat(x)
+#define SGMAX(x) sgMaxCompat(x)
+#else
+#define SGMIN(x) subgroupMin(x)
+#define SGMAX(x) subgroupMax(x)
+#endif
+
+#ifdef SWEEP_NO_INT64
+// The residual's dot product is the only 64-bit arithmetic in the kernel: 32
+// taps of (15-bit coefficient x 24-bit sample) reaches ~37 bits, so uint32
+// cannot hold it and the sum must be exact -- this is the value the CPU is
+// re-priced against. imulExtended/uaddCarry give a 64-bit accumulator out of
+// two 32-bit halves and are core GLSL, needing no capability the device lacks.
+//
+// Returns the low 32 bits of (sum >> shift), which is what the caller needs:
+// the residual itself fits in int by construction.
+int dotShiftCompat(int base, int ord, int i, int shift) {
+    uint lo = 0u;
+    int  hi = 0;
+    for (int j = 0; j < ord; ++j) {
+        int ph, pl;
+        imulExtended(cand[base + 2 + j], samples[i - 1 - j], ph, pl);
+        uint carry;
+        lo = uaddCarry(lo, uint(pl), carry);
+        hi += ph + int(carry);
+    }
+    // shift == 0 would make the high-half funnel a 32-bit shift, which is
+    // undefined in GLSL; the quantizer never emits it, but the guard is free.
+    if (shift == 0) return int(lo);
+    return int((lo >> uint(shift)) | (uint(hi) << uint(32 - shift)));
+}
+#endif
+
+// The streaming fold's state: five per-lane arrays of NLEV levels. At SIMD32
+// each entry is two GRFs, so 5 * 9 = 45 of them is ~90 of a 128-register budget
+// -- fine on a part with a big register file, ruinous on a small one. Measured
+// on Mesa hasvk (Haswell GT2), where the kernel compiles to 342:564
+// spills:fills and the cycle model attributes most of its time to scratch
+// messages rather than to arithmetic.
+//
+// SWEEP_SLM_STATE moves the arrays to shared memory: 128 lanes x 45 uints =
+// 23 KB, inside every device's 32 KB floor, and lane-major so consecutive lanes
+// hit consecutive banks. Scratch on this hardware is memory; SLM is on-chip, so
+// the trade is a same-results one -- the arrays are per-lane private either way,
+// no cross-lane access and no barrier.
+//
+// Both paths go through the accessor macros, so the default variant's SPIR-V is
+// unchanged: `BACC(l)` expands to `Bacc[l]` and compiles as it always did.
+#ifdef SWEEP_SLM_STATE
+#define WG      128
+#define NARR    5
+shared uint sState[NARR * NLEV * WG];
+#define ST(a, l) sState[(uint((a) * NLEV + (l))) * uint(WG) + gl_LocalInvocationID.x]
+#define BACC(l)   ST(0, l)
+#define NACC(l)   ST(1, l)
+#define HACC(l)   ST(2, l)
+#define TOTAL0(l) ST(3, l)
+#define TOTAL1(l) ST(4, l)
+#else
 uint Bacc[NLEV], Nacc[NLEV], Hacc[NLEV];
 uint total0[NLEV], total1[NLEV];
+#define BACC(l)   Bacc[l]
+#define NACC(l)   Nacc[l]
+#define HACC(l)   Hacc[l]
+#define TOTAL0(l) total0[l]
+#define TOTAL1(l) total1[l]
+#endif
 int  gP;
 
 // Close finest partition q, then every coarser level whose span it completes.
@@ -95,9 +196,9 @@ void closePartition(int q, uint B0, uint N0, uint H0) {
     for (int l = gP; l >= 0; --l) {
         if (((q + 1) & ((1 << (gP - l)) - 1)) != 0) break;
 
-        const uint B  = (l == gP) ? B0 : Bacc[l];
-        const uint n  = (l == gP) ? N0 : Nacc[l];
-        const uint hi = (l == gP) ? H0 : Hacc[l];
+        const uint B  = (l == gP) ? B0 : BACC(l);
+        const uint n  = (l == gP) ? N0 : NACC(l);
+        const uint hi = (l == gP) ? H0 : HACC(l);
 
         // S_k as a weighted reverse scan across lanes: five steps for 32 lanes.
         // Every intermediate is bounded by S_0, the sum of the folded
@@ -114,8 +215,8 @@ void closePartition(int q, uint B0, uint N0, uint H0) {
         // min-reduction. Only the value is needed; the parameter itself is
         // reconstructed on the CPU for the winner alone.
         const uint bits = satadd(n * (1u + lane), v);
-        uint best0 = subgroupMin(lane <= 14u ? bits : 0xFFFFFFFFu);
-        uint best1 = subgroupMin(lane <= 30u ? bits : 0xFFFFFFFFu);
+        uint best0 = SGMIN(lane <= 14u ? bits : 0xFFFFFFFFu);
+        uint best1 = SGMIN(lane <= 30u ? bits : 0xFFFFFFFFu);
 
         // Escape code. mabs = m >> 1 so findMSB(mabs) == hi - 1, turning the
         // CPU's (mabs ? findMSB(mabs) + 2 : 1) into (hi >= 1 ? hi + 1 : 1);
@@ -127,15 +228,15 @@ void closePartition(int q, uint B0, uint N0, uint H0) {
             best1 = min(best1, eb);
         }
 
-        total0[l] = satadd(total0[l], best0);
-        total1[l] = satadd(total1[l], best1);
+        TOTAL0(l) = satadd(TOTAL0(l), best0);
+        TOTAL1(l) = satadd(TOTAL1(l), best1);
 
         if (l > 0) {
-            Bacc[l - 1] += B;
-            Nacc[l - 1] += n;
-            Hacc[l - 1]  = max(Hacc[l - 1], hi);
+            BACC(l - 1) += B;
+            NACC(l - 1) += n;
+            HACC(l - 1)  = max(HACC(l - 1), hi);
         }
-        Bacc[l] = 0u; Nacc[l] = 0u; Hacc[l] = 0u;
+        BACC(l) = 0u; NACC(l) = 0u; HACC(l) = 0u;
     }
 }
 
@@ -177,9 +278,9 @@ void main() {
     const int psize = BS >> P;
 
     for (int l = 0; l <= P; ++l) {
-        Bacc[l] = 0u; Nacc[l] = 0u; Hacc[l] = 0u;
-        total0[l] = uint(4 << l);
-        total1[l] = uint(5 << l);
+        BACC(l) = 0u; NACC(l) = 0u; HACC(l) = 0u;
+        TOTAL0(l) = uint(4 << l);
+        TOTAL1(l) = uint(5 << l);
     }
 
     uint Bcur = 0u, Ncur = 0u, Hcur = 0u;
@@ -197,10 +298,14 @@ void main() {
 
         uint u = 0u;
         if (act) {
+#ifdef SWEEP_NO_INT64
+            const int r = samples[i] - dotShiftCompat(base, ord, i, shift);
+#else
             int64_t sum = 0L;
             for (int j = 0; j < ord; ++j)
                 sum += int64_t(cand[base + 2 + j]) * int64_t(samples[i - 1 - j]);
             const int r = samples[i] - int(sum >> shift);
+#endif
             u = (uint(r) << 1) ^ uint(r >> 31);       // zigzag
         }
 
@@ -214,7 +319,7 @@ void main() {
         if (psize >= SG) {
             Bcur += bitCount(myBallot);
             Ncur += uint(bitCount(actMask));
-            Hcur  = max(Hcur, subgroupMax((myBallot != 0u) ? lane : 0u));
+            Hcur  = max(Hcur, SGMAX((myBallot != 0u) ? lane : 0u));
             if (((c0 + SG) & (psize - 1)) == 0) {
                 closePartition(q, Bcur, Ncur, Hcur);
                 ++q; Bcur = 0u; Ncur = 0u; Hcur = 0u;
@@ -225,7 +330,7 @@ void main() {
                 closePartition(q,
                     uint(bitCount(myBallot & mask)),
                     uint(bitCount(actMask  & mask)),
-                    subgroupMax(((myBallot & mask) != 0u) ? lane : 0u));
+                    SGMAX(((myBallot & mask) != 0u) ? lane : 0u));
                 ++q;
             }
         }
@@ -236,8 +341,8 @@ void main() {
     // at best -- keeps its method-0 bitstream untouched.
     uint best_total = 0xFFFFFFFFu;
     for (int l = P; l >= 0; --l) {
-        if (total0[l] <= best_total) best_total = total0[l];
-        if (total1[l] <  best_total) best_total = total1[l];
+        if (TOTAL0(l) <= best_total) best_total = TOTAL0(l);
+        if (TOTAL1(l) <  best_total) best_total = TOTAL1(l);
     }
 
     if (cidx < uint(pc.ncand))

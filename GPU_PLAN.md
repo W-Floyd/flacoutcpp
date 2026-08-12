@@ -305,6 +305,10 @@ downstream of the choice is broken.
 
 ## What is still unmeasured
 
+**The >2x claim is now measured and it holds — see the Tesla P4 section at the
+end.** `-e -L 0`, quiet host, byte-identical arms: 2.21x to 3.11x. The rest of
+this section is the state before that run and is kept for the reasoning.
+
 **The >2x speed claim in the PR description.** The test host was running
 jellyfin (289% CPU), ffmpeg, immich, node and Sonarr, at load average 18-23 on
 40 cores. Per trap 9 in CLAUDE.md every timing from that window is junk.
@@ -411,3 +415,351 @@ Items 1-3 are **done** (see "The fix"). Remaining:
 3. Add a `bench/check.sh` case for `-G` if a GPU is available in the
    environment — the byte-identity claim is exactly what that harness exists to
    pin, and it would have caught both defects.
+
+## `-G` on a constrained iGPU: Haswell HD 4600 (Mesa hasvk)
+
+Second Vulkan platform after the Arc A380, and the first one that could not run
+the kernel at all. Host: Debian forky, kernel 7.1.3, i7-4790 (4c/8t), Intel HD
+Graphics 4600 (HSW GT2, `8086:0412`), Mesa 26.1.5 **hasvk**, which announces
+itself with `MESA-INTEL: warning: Haswell Vulkan support is incomplete`. Binary
+cross-built with `docker/Dockerfile.amd64` as before. A GTX 1080 sits in the same
+box but is bound to `vfio-pci`, so it has no DRM node and never enumerates.
+
+Note for the next person on this host: the render node is `crw-rw----+` with a
+logind ACL granting the desktop user rw directly, so the `render`-group trap
+above does not apply — and `INTEL_DEBUG=cs` prints nothing unless you also pass
+`MESA_SHADER_CACHE_DISABLE=true`, because a cached pipeline never compiles.
+
+### What the device is missing, and what it costs to emulate
+
+`vkprobe` (40 lines against `libvulkan`, since the host has no `vulkaninfo`):
+subgroup size 32, `supportedOperations` = basic/vote/ballot/shuffle/
+shuffle-relative/quad — **no ARITHMETIC** — and **no `shaderInt64`**. Both were
+hard requirements, so `-G` refused the device and `-P` still does.
+
+Both gaps are emulable exactly, which matters more than cheaply: the cost this
+kernel returns has to stay the CPU's to the bit or the byte-identical contract
+goes. `shaders/sweep.comp` now carries two defines, `SWEEP_NO_ARITH`
+(subgroupMin/Max as a 5-step `subgroupShuffleXor` butterfly) and
+`SWEEP_NO_INT64` (the residual dot product via `imulExtended`/`uaddCarry`), and
+`src/gpu.cpp` picks a variant per device. **The default variant's SPIR-V is
+byte-identical to before the change** — checked with `cmp` on `sweep.spv` across
+both toolchains — so a capable part pays nothing.
+
+`FLACOUT_GPU_COMPAT=arith|int64|1` forces a fallback on hardware that does not
+need it, which is how their intrinsic cost was measured. M4 Max, `music_10s`,
+candidates/s (the count varies run to run, so the rate is the comparable figure):
+
+| variant | cand/s | vs fast |
+|---|---|---|
+| fast | 8.59e5 | 1.00x |
+| emulated min/max | 7.52e5 | 0.88x |
+| emulated int64 | 6.13e5 | 0.71x |
+| both | 5.90e5 | 0.69x |
+
+All four byte-identical to the CPU path. So the emulations are worth ~1.45x
+together — and on Haswell the same kernel ran at **1.05e3 cand/s, 640x below the
+M4**, which no hardware ratio explains.
+
+### It was spill-bound, and SLM fixes it (5.8x)
+
+`INTEL_DEBUG=cs`: SIMD32, 5486 instructions, **342:564 spills:fills**, and of 917
+`send` messages 342 are OWORD block writes to `bti 255` — scratch. Attributing
+the compiler's own cycle model by basic block puts the top blocks on memory
+traffic with ~6 multiplies between them. The cause is the streaming fold's five
+per-lane `NLEV`-deep arrays: 45 values, two GRFs each at SIMD32, ~90 of a
+128-register budget.
+
+`SWEEP_SLM_STATE` moves those arrays to shared memory — 128 lanes x 45 uints =
+23 KB, lane-major, no cross-lane access and therefore no barrier:
+
+| | instructions | spills:fills | cycle model | measured |
+|---|---|---|---|---|
+| registers | 5486 | 342:564 | 35.5M | 916 cand/s |
+| SLM | 2739 | 30:54 | 10.7M | **5.33e3 cand/s** |
+
+Output byte-identical throughout. Forced on an M4 Max it measures 0.98x, i.e.
+free, but it is **not** enabled there: the gate is "device is already running an
+emulation", since Vulkan exposes no register-budget query and "integrated" would
+catch Apple too. `FLACOUT_GPU_SLM=1/0` overrides.
+
+### Slots matter more than any of it: 3 slots is 0.26x, 1 slot is 0.94x
+
+Each slot parks a CPU worker on a fence. On a device slower than the host that
+converts directly into idle cores, and this device is much slower than eight
+Haswell threads. `music_3s`, wall clock against CPU-only, all byte-identical
+except where noted:
+
+| config | wall | cand/s | vs CPU |
+|---|---|---|---|
+| cap 8, slots 3 | 2.437s | 5.51e3 | 0.26x |
+| **cap 8, slots 1** | **0.666s** | 9.34e3 | **0.94x** |
+| cap 4, slots 1 | 0.663s | 8.64e3 | 0.94x |
+| cap 2, slots 1 | 0.792s | 3.99e3 | 0.79x, **output differs** |
+
+`--gpu-slots` therefore defaults to auto: 3 normally, 1 when the device is on the
+compat kernel. Note `--gpu-partition-cap 4` buys nothing once slots are right —
+before SLM it was worth 2.7x, after it is noise. Trap 3 in CLAUDE.md, again.
+
+### Where it lands, and the honest verdict
+
+Auto defaults, clean environment, `pgrep -x flacoutcpp` empty, load steady at
+1.0, interleaved best-of-3:
+
+| fixture | CPU | `-G` | ratio |
+|---|---|---|---|
+| music_3s | 0.632s | 0.646s | 0.98x |
+| music_10s | 1.850s | 1.931s | 0.96x |
+| s24_2s | 0.465s | 0.830s | **0.56x** |
+
+Six fixtures (16/24-bit, mono/stereo, the short-stream path) are byte-identical
+to the CPU path over two `-G` runs each, decode to the input's audio MD5, and
+pass `flac -t`. So **the fallbacks make a 2013 iGPU a correct participant, and
+not yet a profitable one**: neutral on 16-bit music, still clearly negative on
+24-bit, where the emulated 64-bit dot product is widest and RICE2 puts real work
+in planes 15-30.
+
+What would make it profitable is not another kernel trick but a **throughput-aware
+throttle**: `duty` and slots are static, so the encoder cannot notice that this
+device prices candidates ~90x slower than the M4's and hand the surplus back on
+its own. Measuring device and host candidate rates and setting `duty` from the
+ratio would bound the loss at ~1.0x on any device and let a good one still win —
+and it is the same mechanism that would let `--gpu-slots 3` stay safe everywhere.
+
+`-P` remains unavailable here: 13 kernels, `int64` throughout the Rice, packing
+and CRC stages, so the same two emulations are a much larger port than one
+`sweep.comp`. Nothing about the above says it is impossible, only that it was not
+attempted.
+
+### Third platform: UHD 630 (CFL GT2, Mesa ANV) — and SLM is a *loss* there
+
+Host: CachyOS, kernel 7.0.9, i7-8700 (6c/12t), Intel UHD Graphics 630 (Gen9.5)
+under ANV 26.1.2. A **Tesla P4** sits in the same box and did not enumerate: the
+NVIDIA kernel module is 580.159.03 against 580.159.04 userspace (a package
+upgrade with no reboot, 82 days uptime), so the loader rejects the ICD with
+`Could not get 'vkCreateInstance' ... for ICD libGLX_nvidia.so.0` and `nvidia-smi`
+reports the matching NVML mismatch. Needs a reboot; nothing to do with this code.
+
+Unlike Haswell this part has the full feature set — subgroup 32, arithmetic,
+`shaderInt64` — so it runs the **fast** kernel, and it is the device that decides
+whether the SLM fallback should be gated on "constrained" or turned on for
+integrated parts generally. `music_3s` / `s24_2s`, best-of-3, every row
+byte-identical to the CPU path:
+
+| config | music_3s | vs CPU | s24_2s | vs CPU |
+|---|---|---|---|---|
+| CPU only (12 threads) | 0.366s | 1.000 | 0.303s | 1.000 |
+| **registers, slots 3** | **0.631s** | **0.580** | 1.092s | 0.277 |
+| registers, slots 1 | 0.690s | 0.531 | **0.440s** | **0.689** |
+| SLM, slots 3 | 0.784s | 0.467 | 1.580s | 0.192 |
+| SLM, slots 1 | 0.868s | 0.422 | 0.466s | 0.650 |
+
+**SLM costs 20-30% on Gen9.5**, so the "only when the device is already
+emulating" gate is right and must not be widened to integrated parts: the fix for
+a 128-register Haswell at SIMD32 is a pessimisation on a part that can hold the
+arrays. Two devices now agree that a capable part should keep the register
+version (M4 Max 0.98x, i.e. free-but-pointless; UHD 630 0.78x, a real loss).
+
+Also note the slots optimum **flips with bit depth** on the same device: 3 slots
+win on 16-bit `music_3s` and lose 2.5x on 24-bit `s24_2s`, where candidates are
+heavier and a parked worker waits longer. Static slot counts cannot be right for
+both, which is the same argument for an adaptive throttle from a second direction.
+
+`FLACOUT_GPU_COMPAT` also makes this host a correctness check for the fallbacks on
+a third driver: all six fixtures byte-identical to the CPU path under fast,
+emulated-min/max, emulated-int64 and both, and lossless by decode. So the
+emulations are now pinned on MoltenVK (Apple), hasvk (Haswell) and ANV (Gen9.5).
+
+And the headline number is unchanged by better silicon: **`-G` is a net loss on
+this iGPU too**, best 0.69x. A 2018 integrated part against six modern cores is
+still the wrong side of the trade for this kernel.
+
+## Fourth platform: Tesla P4 (Pascal, NVIDIA 580.173.02) — the >2x claim, verified
+
+Same CachyOS host as the UHD 630 above (i7-8700, 6c/12t), once the driver mismatch
+was fixed by a reboot. `vkprobe`: subgroup 32, arithmetic, `shaderInt64` — full
+feature set, so it runs the **fast** kernel with no fallback, and it is the first
+NVIDIA device this code has run on at all.
+
+**This is the device the design was waiting for.** Exhaustive DP, `-e -L 0` pinned
+on both arms, quiet host, best-of-2, every output byte-identical to CPU-only:
+
+| workload | CPU (12 threads) | `-G` | ratio | cand/s |
+|---|---|---|---|---|
+| mono_2s | 14.98s | 6.79s | **2.21x** | 2.58e5 |
+| s24_2s | 85.69s | 27.58s | **3.11x** | 2.65e5 |
+| music_3s | 136.27s | 44.30s | **3.08x** | 2.56e5 |
+
+So the PR's ">2x" is real, on hardware that is not the author's Mac, with the arms
+compressing to identical bytes — which is the form of the claim that was never
+established before (see "What is still unmeasured"). Note the pattern: the deeper
+the search, the better the device does, because `-e` is where candidates-per-block
+is large enough to fill a dispatch.
+
+Estimated DP is a much weaker story, as the fixed costs (decode, MD5, ~28 ms device
+init) floor short fixtures:
+
+| workload | CPU | `-G` | ratio |
+|---|---|---|---|
+| MLKDream (28 MB, default `-L 0`) | 18.46s | 15.84s | 1.165x |
+| music_10s (default) | 0.978s | 0.821s | 1.191x |
+| music_3s / s24_2s (default) | — | — | ~1.00x |
+
+Slots behave exactly as the M4 table predicted — U-shaped with the default at or
+near the optimum, and a cliff past 6:
+
+| slots | music_3s | music_10s | s24_2s |
+|---|---|---|---|
+| 1 | 0.892x | 1.191x | 0.912x |
+| **3 (default)** | 1.000x | 1.184x | 1.002x |
+| 6 | 0.932x | 1.135x | 0.935x |
+| 12 | 0.683x | 0.669x | 0.884x |
+
+Taken with the two iGPUs, the shape of the whole result is: **`-G` pays when the
+device is a real GPU and the search is deep.** Integrated parts lose on both
+counts (0.56-0.98x), and on the same discrete card the estimator only reaches
+~1.19x while `-e` reaches 3.1x.
+
+### Host traps on this box, all three of which cost measurements
+
+- **The GDM greeter idle-suspends the machine.** Left parked on the login screen,
+  the greeter's own `gsd-power` (uid 60578, *not* the logged-in user's) requests
+  S3 after 900 s — it fired mid-benchmark and the box was unreachable for seven
+  minutes. It does this **even though another user is logged in on another VT**,
+  and `sleep-inactive-ac-type` for uid 1000 was already `'nothing'`, so checking
+  your own session's settings proves nothing. Fix needs root: set the same keys
+  for the `gdm` user, or `systemctl mask sleep.target suspend.target`.
+  `systemd-inhibit` is *not* a workaround here — it fails with `Access denied ...
+  requires interactive authentication`.
+- **A suspend silently corrupts wall clock.** `date +%s.%N` deltas (and
+  `/proc/uptime`) include suspended time, and `uptime` does not reset, so the
+  aftermath looks like a slow run on a machine that never rebooted rather than
+  like a suspend. `bench`-side scripts on this host should bracket every
+  measurement with `journalctl -k | grep -c "PM: suspend entry"` and void the
+  timing if it moved.
+- **`-G` does not survive suspend/resume, and wedges.** The run that straddled the
+  suspend made no further progress: a 44-second job was still going 13 minutes
+  later, at 45% CPU with the GPU at 0% utilisation, and it **ignored SIGKILL**
+  (stuck in a driver ioctl) for a while before dying. The Vulkan device is lost
+  across S3 and nothing in `GpuEvaluator` notices. Worth fixing independently of
+  suspend, since `VK_ERROR_DEVICE_LOST` is reportable on any submit or fence
+  wait: treat it as "disable the GPU path and finish on the CPU", which is
+  already the behaviour for a device that never initialised.
+
+## Two things the multi-device work exposed, and the fixes for both
+
+### 1. A lost device used to wedge the encode
+
+Found by accident: a host suspended to S3 mid-encode (see the traps above), and
+the `-G` run never made progress again. A 44-second job was still running 13
+minutes later at 45% CPU with the GPU at 0% utilisation, and it **ignored
+SIGKILL** for a while, stuck in a driver ioctl. Nothing in `GpuEvaluator`
+checked a `VkResult` other than to return `false` for that one batch, so a device
+that had gone away was re-offered work for the rest of the file.
+
+`Impl::fail_device` now takes the whole path down on any failure from
+`vkResetCommandBuffer`, `vkBeginCommandBuffer`, `vkEndCommandBuffer`,
+`vkQueueSubmit` or `vkWaitForFences`, prints which call failed, and lets the
+encode finish on the CPU — which is already the behaviour for a device that never
+initialised, so there is no new failure mode to reason about. `ok` became atomic
+for it (it is now cleared from worker threads while others read it).
+
+Note what this cannot fix: the wait that never returns. `vkWaitForFences` with
+`UINT64_MAX` on a driver that is gone does not report an error, it blocks, and a
+finite timeout would trade a hang for a wrong answer about whether the batch
+completed. Every failure mode the driver *reports* is now handled; the one it
+does not report needs the driver not to lie.
+
+### 2. Fixed shares cannot work, so the throttle measures instead
+
+`duty` and `--gpu-slots` were static, and no static value survives contact with
+four devices: 3 slots are optimal on a Tesla P4 and cost 3.7x on a Haswell iGPU,
+and on one device the best slot count **flips with bit depth**. So the encoder now
+measures both sides and compares them.
+
+The comparison is device MACs/s against **one CPU thread's** MACs/s, because the
+thread that offers a batch is the thread that blocks on the fence — the question
+is never "is the GPU fast" but "is it faster than the worker it idles". Both rates
+are EMAs of real measurements: the device's from `evaluate` (submit through
+readback, so dispatch overhead is included and small batches price themselves out
+without needing `min_batch`), the CPU's from one timed candidate per subframe in
+`Optimizer::optimize_subframe`. Output is unaffected by any routing decision —
+both paths return the same cost — which is what makes this safe to tune at all.
+
+Four things went wrong on the way, each measured, none obvious:
+
+- **The control loop starved itself.** Accepting everything during warm-up meant
+  the CPU never ran a batch, so `cpu_samples` stayed at 0, warm-up never ended,
+  and a device 20x slower than one thread reported the ratio correctly (0.05x)
+  while accepting **100%** of offers. Warm-up now takes only 1 offer in 8 and
+  needs 3 samples per side.
+- **Deciding inside `evaluate` was too late.** The caller builds a batch — a
+  quantize pass over every (candidate, precision) pair — *before* offering it, so
+  a late decline pays for the batch twice. A UHD 630 declining 93% of offers still
+  gave up 18% of wall clock. The decision moved into `would_accept()`, which is
+  where the same reasoning was already written down for `min_batch`.
+- **Probing a hopeless device is not free.** At a flat 1-in-64 re-probe a UHD 630
+  still leaked 9% of batches. The interval now backs off geometrically to 4096,
+  and below parity the path shuts down entirely, because pinning `--gpu-duty 1`
+  — an essentially idle device — *still* cost 10% against CPU-only. An awake iGPU
+  takes package power and memory bandwidth from the cores whatever it is doing.
+- **A busy device flatters itself.** The CPU rate is measured while the device
+  runs, and the device depresses it: the same UHD 630 reads 0.30x against an
+  idle-pool CPU rate and 0.50x against the rate it has itself dragged down. A
+  give-up threshold below parity therefore lets a device stay alive by slowing
+  down its own competition, which is why the threshold is parity and the accept
+  margin is 1.5x.
+
+That 1.5x margin covers measured interference, which is the part of this that
+inverted the obvious guess. Single-thread CPU rate with the device idle
+(`--gpu-duty 1`) against saturated (`--gpu-duty 100`), music_10s:
+
+| device | idle | saturated | change |
+|---|---|---|---|
+| UHD 630 (CFL iGPU, 12 threads) | 2.14-2.18e9 | 1.34-1.90e9 | **-13 to -38%** |
+| Tesla P4 (discrete, 12 threads) | 2.18-2.33e9 | 1.43-2.02e9 | **-12 to -38%** |
+| Haswell HD 4600 (iGPU, 8 threads) | 1.70-1.75e9 | 1.81-1.86e9 | none |
+
+The iGPU *does* steal from the CPU on Coffee Lake — shared power budget and ring
+bus — and the discrete card does too, through host-visible buffer traffic. Haswell
+escapes only because its compat kernel is slow enough that it barely loads the
+device. So "integrated means it competes with the cores" is true, but it is not
+the whole story and it is not what distinguishes the devices here.
+
+Result, `music_10s`, best-of-3, everything byte-identical to CPU-only. The old
+default is `--gpu-duty 100` at the slot count that device would have used:
+
+| device | old default | adaptive | CPU-only |
+|---|---|---|---|
+| Haswell HD 4600 (slots 1 auto) | 0.948x | 0.955x | 1.000 |
+| Haswell HD 4600 at slots 3 | 0.477x | **0.893x** | 1.000 |
+| UHD 630 (slots 3) | 0.593x | **0.825-0.849x** | 1.000 |
+| M4 Max (`-e -L 0`, mono_2s) | 1.73x | 1.72x | 1.000 |
+
+And what it costs a device that deserves the work. Tesla P4, same session,
+interleaved, best-of-3 (the only valid way to compare these -- an earlier
+cross-session pinned number read 2.207x and is not comparable):
+
+| workload | pinned | adaptive | premium |
+|---|---|---|---|
+| mono_2s `-e -L 0` | 2.152x | 2.042x | **5%** |
+| s24_2s `-e -L 0` | 3.107x | 3.011x | 3% |
+| music_10s default | 1.191x | **1.338x** | -12% (adaptive wins) |
+| MLKDream default | 1.144x | **1.379x** | -21% (adaptive wins) |
+
+Adaptive is *better* in estimated DP, where declining some batches avoids parked
+workers the pinned share cannot refuse, and ~3-5% worse in exhaustive mode. Most
+of that premium was the CPU probe: at a flat 1-in-64 it hands a whole subframe to
+a CPU 68x slower per MAC in that mode, so the interval now scales with the
+measured ratio (mono_2s went 1.994x -> 2.042x on that change alone). What is left
+is warm-up -- ~21 declined offers before the ratio is known -- and closing that
+would mean accepting more while still ignorant, which is precisely what makes a
+slow device catastrophic. **5% on a winning device is the premium for bounding
+the loss at ~0.9x instead of 0.12x on a losing one, without knowing which is
+which in advance.**
+
+So the throttle's value is not that it makes an iGPU pay — it does not, and no
+iGPU tested ever will for this kernel. Its value is that **the catastrophic
+configurations are gone without per-device tuning**: the worst case moves from
+0.12-0.48x to ~0.85-0.9x, a winning device keeps its speedup to within 0.5%, and
+neither outcome needed anyone to know which device they had.

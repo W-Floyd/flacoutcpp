@@ -23,6 +23,11 @@ void GpuEvaluator::set_slots(int) {}
 int GpuEvaluator::slots() const { return 0; }
 void GpuEvaluator::set_duty(int) {}
 int GpuEvaluator::duty() const { return 100; }
+void GpuEvaluator::note_cpu(uint64_t, double) {}
+bool GpuEvaluator::gave_up() const { return false; }
+void GpuEvaluator::throttle_stats(double* g, double* c, double* a) const {
+    if (g) *g = 0.0; if (c) *c = 0.0; if (a) *a = 0.0;
+}
 bool GpuEvaluator::would_accept() const { return false; }
 uint64_t GpuEvaluator::macs() const { return 0; }
 } // namespace flacoutcpp
@@ -32,10 +37,19 @@ uint64_t GpuEvaluator::macs() const { return 0; }
 #include <vulkan/vulkan.h>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
 
-#include "sweep_spv.h"   // generated at build time from shaders/sweep.comp
+#include "sweep_spv.h"            // generated at build time from shaders/sweep.comp
+// Fallback variants of the same source, one per missing-feature combination.
+#include "sweep_noarith_spv.h"     // -DSWEEP_NO_ARITH
+#include "sweep_noint64_spv.h"     // -DSWEEP_NO_INT64
+#include "sweep_compat_spv.h"      // both
+#include "sweep_slm_spv.h"         // -DSWEEP_SLM_STATE
+#include "sweep_compat_slm_spv.h"  // all three
 
 namespace flacoutcpp {
 
@@ -63,7 +77,9 @@ struct PushConsts {
 
 struct GpuEvaluator::Impl {
     std::string why;
-    bool ok = false;
+    // Atomic because it is no longer write-once: a lost device clears it from a
+    // worker thread while other workers are reading it in would_accept().
+    std::atomic<bool> ok{false};
 
     VkInstance       inst   = VK_NULL_HANDLE;
     VkPhysicalDevice phys   = VK_NULL_HANDLE;
@@ -118,14 +134,206 @@ struct GpuEvaluator::Impl {
     std::atomic<bool>     warned_invalid{false};
     // VK_EXT_subgroup_size_control present, usable, and able to pin 32.
     bool size_ctl = false;
+    // Which fallbacks the kernel is running with, because the device lacks the
+    // feature or because FLACOUT_GPU_COMPAT forced it (see shaders/sweep.comp).
+    // Same costs either way, more instructions; the point is that constrained
+    // parts get a GPU path at all.
+    bool emu_arith = false;
+    bool emu_int64 = false;
+    // Fold state in shared memory instead of registers, for parts whose register
+    // file cannot hold it (see shaders/sweep.comp).
+    bool slm_state = false;
     // Share throttle. Work is claimed greedily -- a subframe goes to the GPU
     // whenever a slot is free -- which over-commits a device slower than the
     // host: the CPU finishes its share early and idles at the DP's barrier
     // while the GPU is still working. Accepting only `duty` percent of offers
     // hands the surplus back. Deterministic (a counter, not a coin) so a run
     // stays reproducible; the output is invariant to the split either way.
-    std::atomic<int>      duty{100};
+    std::atomic<int>      duty{0};   // 0 = adaptive, see the note below
     std::atomic<uint64_t> offers{0};
+    std::atomic<uint64_t> taken{0};
+
+    // ---- adaptive throttle -------------------------------------------------
+    //
+    // A fixed duty (or a fixed slot count) cannot be right, and that is
+    // measured, twice: on a Haswell iGPU three slots cost 3.7x against one,
+    // while on a Tesla P4 three slots are the optimum and one loses 10%; and on
+    // a single UHD 630 the best slot count *flips with bit depth*, because 24-bit
+    // candidates are heavier and park a worker for longer. What decides it is
+    // whether the device prices work faster than the one CPU thread that has to
+    // block waiting for it -- so measure exactly that and compare.
+    //
+    // Both rates are in MACs/second, which is the unit that makes batches of
+    // different block size and order comparable; the device's rate already
+    // includes its own dispatch overhead amortised over the batch, so a device
+    // with a long submit path prices small batches badly and is declined for
+    // them without needing a separate min_batch heuristic.
+    //
+    // EMAs rather than totals, so a device that slows down (thermal, contention,
+    // a fatter mix of candidates) is noticed. Stored as bit-cast doubles in
+    // atomics: every worker updates them, and a torn read here would cost a
+    // slightly wrong routing decision, never a wrong output -- both paths return
+    // the same cost, which is the contract that makes this safe to tune at all.
+    std::atomic<uint64_t> gpu_rate{0};   // MACs/s, EMA, 0 = unmeasured
+    std::atomic<uint64_t> cpu_rate{0};   // MACs/s, EMA, one thread
+    std::atomic<uint32_t> gpu_samples{0};
+    std::atomic<uint32_t> cpu_samples{0};
+    // Warm-up, until both sides have this many samples. It has to *alternate*
+    // rather than accept everything: the CPU rate can only be measured on a
+    // batch the CPU actually ran, so a warm-up that accepts unconditionally
+    // starves itself of half its own input and never leaves warm-up. Measured
+    // before the alternation was added -- a Haswell iGPU 20x slower than one
+    // thread reported the ratio correctly (0.05x) and still accepted 100% of
+    // offers, because `cpu_samples` sat at zero for the whole encode.
+    // Three samples per side, and only one offer in WARMUP_TAKE goes to the
+    // device while learning. The asymmetry is deliberate: a wrong accept on a
+    // device 20x slower than a thread costs that batch's CPU time over again
+    // many times, a wrong decline costs nothing at all, and the gaps this has to
+    // resolve are factors of 3-20, not percentages. It also matters that files
+    // are short in these units -- a 3-second fixture offers only a few dozen
+    // batches, so a warm-up of 8 accepted samples *was* the whole encode.
+    static constexpr uint32_t WARMUP = 3;
+    static constexpr uint64_t WARMUP_TAKE = 8;
+    // Re-probe a declined device occasionally, so one that was slow at the start
+    // of a file (cold clocks, a small-batch phase) can win the work back --
+    // backing off geometrically while it keeps losing, because on a device that
+    // is 10x slower every probe costs ten batches' worth of CPU time and the
+    // answer has not changed in a thousand offers. Measured need for this: at a
+    // flat 1-in-64 a UHD 630 still leaked 9% of batches and gave up 18% of wall
+    // clock, where the ratio it was rejected on was 0.30x.
+    static constexpr uint64_t REPROBE_MIN = 64;
+    static constexpr uint64_t REPROBE_MAX = 4096;
+    std::atomic<uint64_t> reprobe{REPROBE_MIN};
+    // And the symmetric probe: while the device is winning every offer the CPU
+    // rate stops being measured and goes stale, which matters because it is the
+    // rate that moves -- thread count, contention, block size mix. One batch in
+    // this many goes to the CPU purely to refresh it.
+    static constexpr uint64_t CPU_PROBE     = 64;
+    static constexpr uint64_t CPU_PROBE_MAX = 4096;
+    // Accept only if the device beats one CPU thread by this margin. It is 1.5
+    // rather than ~1.0 because a saturated device also slows the rest of the
+    // pool down, and that cost appears in neither rate. Measured by pinning duty
+    // to 1 (device idle) and to 100 (device saturated) and reading the
+    // single-thread CPU rate both ways, music_10s:
+    //
+    //   Haswell HD 4600 (iGPU, 8 threads)   1.70-1.75e9 -> 1.81-1.86e9  (none)
+    //   Tesla P4 (discrete, 12 threads)     2.18-2.33e9 -> 1.43-2.02e9  (-12..-38%)
+    //
+    // So it is the *discrete* card that costs the pool -- host-visible buffer
+    // traffic competing for memory bandwidth -- not the iGPU, which is the
+    // opposite of the obvious guess. It changes nothing at the extremes (an
+    // iGPU at 0.1x is declined either way, the P4 at 11x accepted either way);
+    // the margin exists for devices that land near parity, where a 1.2x device
+    // that costs the pool 20% is not worth taking.
+    static constexpr double MARGIN = 1.50;
+    // Below this ratio the device is not a slower helper, it is a liability, and
+    // the path shuts down (see the give-up branch). Parity, not something safely
+    // below it, because the ratio is measured *while the device is running* and
+    // interference biases it upward: on a UHD 630 the same device reads 0.30x
+    // against an idle-pool CPU rate and 0.50x against the rate it depresses
+    // itself, so a threshold under parity lets a device keep itself alive by
+    // slowing down its competition. Nothing measured lands between parity and
+    // 9x (M4 Max, Tesla P4), so this costs no real device its slot.
+    static constexpr double   GIVEUP = 1.00;
+    // Enough evidence, but reachable on a short file: a 2-second fixture offers
+    // only a few dozen batches, and at 64 the give-up never fired on one at all.
+    static constexpr uint64_t GIVEUP_AFTER = 16;
+    std::atomic<bool> gave_up{false};
+
+    static double rd(const std::atomic<uint64_t>& a) {
+        const uint64_t b = a.load(std::memory_order_relaxed);
+        double d = 0.0;
+        std::memcpy(&d, &b, sizeof d);
+        return d;
+    }
+    static void ema(std::atomic<uint64_t>& a, std::atomic<uint32_t>& n, double x) {
+        if (!(x > 0.0) || !std::isfinite(x)) return;
+        const double prev = rd(a);
+        const double next = prev > 0.0 ? prev * 0.75 + x * 0.25 : x;
+        uint64_t bits = 0;
+        std::memcpy(&bits, &next, sizeof bits);
+        a.store(bits, std::memory_order_relaxed);
+        n.fetch_add(1, std::memory_order_relaxed);
+    }
+    /// Should the next batch go to the device? See the note above.
+    ///
+    /// Called from would_accept(), i.e. *before* the caller builds the batch,
+    /// and not from evaluate(). That placement is not cosmetic: building a batch
+    /// costs a quantize pass over every (candidate, precision) pair, and a
+    /// throttle that declined afterwards threw all of it away and made the CPU
+    /// redo it. Measured with the decision inside evaluate(): a UHD 630 declined
+    /// 93% of offers and still gave up 18% of wall clock, because the encoder was
+    /// paying for 93% of the batches twice. The same reasoning is already
+    /// written down for min_batch in optimizer.cpp.
+    bool throttle_ok() {
+        const int dty = duty.load(std::memory_order_relaxed);
+        if (dty > 0) {   // pinned share: the old deterministic counter
+            const uint64_t n = offers.fetch_add(1, std::memory_order_relaxed);
+            if (dty >= 100) return true;
+            return (int)((n * 100) % 10000 / 100) < dty;
+        }
+        const uint64_t n = offers.fetch_add(1, std::memory_order_relaxed);
+        const bool need_cpu = cpu_samples.load(std::memory_order_relaxed) < WARMUP;
+        const bool need_gpu = gpu_samples.load(std::memory_order_relaxed) < WARMUP;
+        if (need_cpu || need_gpu)
+            return (n % WARMUP_TAKE) == 0;   // learn from both, mostly on the CPU
+
+        const double g = rd(gpu_rate), c = rd(cpu_rate);
+        if (!(g > 0.0) || !(c > 0.0))
+            return (n % CPU_PROBE) != 0;   // rates unknown: probe at the base rate
+
+        // Keep the CPU rate fresh, but pay for it in proportion to what it costs.
+        // A probe hands one subframe to a CPU that may be far slower per MAC, so
+        // on a device winning by 68x a flat 1-in-64 probe spends ~1.6% of the
+        // whole run re-measuring something that has not changed -- which is most
+        // of what `-G` gave back against a pinned duty in exhaustive mode on a
+        // Tesla P4 (3.011x against 3.107x). Scale the interval with the ratio and
+        // that cost stays near 1.6% of one probe instead.
+        const double ratio = g / c;
+        uint64_t cpu_iv = (uint64_t)(CPU_PROBE * (ratio > 1.0 ? ratio : 1.0));
+        if (cpu_iv > CPU_PROBE_MAX) cpu_iv = CPU_PROBE_MAX;
+        if ((n % cpu_iv) == 0) return false;
+        if (g > c * MARGIN) {
+            reprobe.store(REPROBE_MIN, std::memory_order_relaxed);
+            return true;
+        }
+        // Decisively losing, with enough evidence: stop using the device at all,
+        // rather than trickling probes at it forever. Probing is not free even at
+        // a 1-in-4096 rate -- measured on a UHD 630, pinning duty to 1 (so the
+        // device is essentially idle) still cost 10% of wall clock against
+        // CPU-only, because an awake iGPU takes package power and memory
+        // bandwidth from the cores whatever it is doing. A device this far behind
+        // is never going to catch up within one file, so the only way to recover
+        // that 10% is to leave it alone.
+        if (g < c * GIVEUP && n >= GIVEUP_AFTER) {
+            if (!gave_up.exchange(true, std::memory_order_relaxed)) {
+                ok.store(false, std::memory_order_relaxed);
+                std::fprintf(stderr,
+                    "GPU: device prices work at %.2fx one CPU thread; switching "
+                    "the rest of this encode to the CPU.\n", g / c);
+            }
+            return false;
+        }
+        // Losing, but not hopelessly. Take one offer per `reprobe`, then double
+        // the interval up to the cap; a probe that wins resets it above.
+        const uint64_t iv = reprobe.load(std::memory_order_relaxed);
+        if ((n % iv) != 0) return false;
+        if (iv < REPROBE_MAX)
+            reprobe.store(iv * 2, std::memory_order_relaxed);
+        return true;
+    }
+
+    /// A device that has gone away takes the whole path down with it, and the
+    /// encode finishes on the CPU. Any error is treated this way, not just
+    /// DEVICE_LOST: once a submit or a wait has failed there is no reason to
+    /// believe the next one, and the fallback is always correct.
+    bool fail_device(VkResult r, const char* where) {
+        if (!ok.exchange(false, std::memory_order_relaxed)) return false;
+        std::fprintf(stderr,
+            "GPU: device lost at %s (VkResult %d) -- disabling the GPU path; "
+            "the rest of this encode runs on the CPU.\n", where, (int)r);
+        return false;
+    }
 
     static constexpr uint32_t WG = 128;  // 4 candidates per work group
 
@@ -244,6 +452,30 @@ bool GpuEvaluator::Impl::init() {
         vkGetPhysicalDeviceProperties(devs[i], &p);
         if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) { pick = (int)i; break; }
     }
+    // FLACOUT_GPU_DEVICE overrides that: an index, or a substring of the device
+    // name. Needed to measure anything on a machine with two devices, since
+    // "prefer discrete" otherwise makes the integrated one untestable -- which
+    // is how the interference question above nearly went unanswered.
+    if (const char* sel = std::getenv("FLACOUT_GPU_DEVICE")) {
+        const std::string want(sel);
+        bool found = false;
+        if (!want.empty() && want.find_first_not_of("0123456789") == std::string::npos) {
+            const uint32_t idx = (uint32_t)std::strtoul(want.c_str(), nullptr, 10);
+            if (idx < nd) { pick = (int)idx; found = true; }
+        } else {
+            for (uint32_t i = 0; i < nd && !found; ++i) {
+                VkPhysicalDeviceProperties p{};
+                vkGetPhysicalDeviceProperties(devs[i], &p);
+                if (std::string(p.deviceName).find(want) != std::string::npos) {
+                    pick = (int)i; found = true;
+                }
+            }
+        }
+        if (!found)
+            std::fprintf(stderr,
+                "GPU: FLACOUT_GPU_DEVICE='%s' matched no device; using the "
+                "default choice.\n", sel);
+    }
     phys = devs[pick];
 
     VkPhysicalDeviceProperties props{};
@@ -303,19 +535,65 @@ bool GpuEvaluator::Impl::init() {
               " (and VK_EXT_subgroup_size_control is unavailable to pin it)";
         return false;
     }
+    // Ballot and shuffle-relative are structural: the bit-plane fold IS a
+    // ballot, and the weighted reverse scan is a shuffle-down. Nothing cheap
+    // replaces either, so they stay hard requirements.
     const VkSubgroupFeatureFlags needsg =
         VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT |
-        VK_SUBGROUP_FEATURE_ARITHMETIC_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT;
+        VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT;
     if ((sgp.supportedOperations & needsg) != needsg) {
         why = std::string(props.deviceName) +
-              ": missing required subgroup operations (ballot/arithmetic/shuffle)";
+              ": missing required subgroup operations (basic/ballot/shuffle-relative)";
         return false;
     }
 
     VkPhysicalDeviceFeatures feat{};
     vkGetPhysicalDeviceFeatures(phys, &feat);
-    if (!feat.shaderInt64) {
-        why = std::string(props.deviceName) + ": shaderInt64 unavailable";
+
+    // Two soft requirements, each with a fallback in the shader. Mesa hasvk on
+    // Haswell misses both, which is what motivated them -- and the reason the
+    // fallbacks are emulation rather than approximation is that the cost this
+    // kernel returns must stay exactly the CPU's, or the byte-identical
+    // contract (and bench/check.sh with it) breaks.
+    const bool arith = (sgp.supportedOperations &
+                        VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) != 0;
+    emu_arith = !arith;
+    emu_int64 = !feat.shaderInt64;
+
+    // FLACOUT_GPU_COMPAT forces a fallback on a device that does not need it:
+    // `arith`, `int64` or `1`/`both`. That is how the emulations get measured
+    // and bit-exactness-checked on hardware that can also run the fast variant
+    // -- otherwise the only way to test them is to own a 2013 iGPU.
+    if (const char* e = std::getenv("FLACOUT_GPU_COMPAT")) {
+        const std::string w(e);
+        if (w == "arith" || w == "1" || w == "both") emu_arith = true;
+        if (w == "int64" || w == "1" || w == "both") emu_int64 = true;
+    }
+    // Fold state to shared memory on any device constrained enough to be running
+    // an emulation, which is the only signal Vulkan offers for "small register
+    // file" -- there is no queryable GRF budget. Measured on Haswell GT2, where
+    // the register-resident arrays compile to 342:564 spills:fills and SLM is
+    // worth 5.8x; and on an M4 Max, where forcing it is 0.98x, i.e. free.
+    // Capable devices keep the register version, so none of this is on their
+    // path at all. FLACOUT_GPU_SLM=1/0 forces it either way.
+    slm_state = emu_arith || emu_int64;
+    if (const char* e = std::getenv("FLACOUT_GPU_SLM"))
+        slm_state = (e[0] == '1');
+    if (slm_state &&
+        props.limits.maxComputeSharedMemorySize < 5u * 9u * 128u * 4u)
+        slm_state = false;
+
+    // Auto slot count. One slot on a constrained device: each slot parks a CPU
+    // worker on a fence, and a device slower than the host converts that into
+    // idle cores -- Haswell GT2 at 3 slots is 0.26x the CPU-only wall clock, at
+    // 1 slot 0.94x, same output. --gpu-slots overrides.
+    if (emu_arith || emu_int64) nslot.store(1, std::memory_order_relaxed);
+
+    // subgroupMin/Max are emulated with a shuffle-xor butterfly, so plain
+    // SHUFFLE is required once ARITHMETIC is missing.
+    if (emu_arith && !(sgp.supportedOperations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT)) {
+        why = std::string(props.deviceName) +
+              ": no subgroup arithmetic and no shuffle to emulate it with";
         return false;
     }
 
@@ -346,7 +624,7 @@ bool GpuEvaluator::Impl::init() {
     qci.queueCount = 1;
     qci.pQueuePriorities = &prio;
     VkPhysicalDeviceFeatures want{};
-    want.shaderInt64 = VK_TRUE;
+    want.shaderInt64 = feat.shaderInt64;
     VkPhysicalDeviceSubgroupSizeControlFeaturesEXT sgf_on{};
     sgf_on.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT;
     sgf_on.subgroupSizeControl  = VK_TRUE;
@@ -412,8 +690,21 @@ bool GpuEvaluator::Impl::init() {
 
     VkShaderModuleCreateInfo smci{};
     smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    smci.codeSize = sizeof(kSweepSpv);
-    smci.pCode    = kSweepSpv;
+    // Five variants, not 2^3: SLM only exists paired with the full set of
+    // emulations or with none, because the parts that need one need the other.
+    if (emu_arith && emu_int64 && slm_state) {
+        smci.codeSize = sizeof(kSweepCompatSlmSpv); smci.pCode = kSweepCompatSlmSpv;
+    } else if (emu_arith && emu_int64) {
+        smci.codeSize = sizeof(kSweepCompatSpv);   smci.pCode = kSweepCompatSpv;
+    } else if (emu_arith) {
+        smci.codeSize = sizeof(kSweepNoArithSpv);  smci.pCode = kSweepNoArithSpv;
+    } else if (emu_int64) {
+        smci.codeSize = sizeof(kSweepNoInt64Spv);  smci.pCode = kSweepNoInt64Spv;
+    } else if (slm_state) {
+        smci.codeSize = sizeof(kSweepSlmSpv);      smci.pCode = kSweepSlmSpv;
+    } else {
+        smci.codeSize = sizeof(kSweepSpv);         smci.pCode = kSweepSpv;
+    }
     if (vkCreateShaderModule(dev, &smci, nullptr, &shader) != VK_SUCCESS) {
         why = "shader module"; return false;
     }
@@ -466,8 +757,11 @@ bool GpuEvaluator::Impl::init() {
     }
 
     why = std::string(props.deviceName) + " (subgroup 32 " +
-          (size_ctl ? "pinned" : "by default") + ", shaderInt64)";
-    ok = true;
+          (size_ctl ? "pinned" : "by default") +
+          (emu_arith ? ", emulated subgroup min/max" : "") +
+          (emu_int64 ? ", emulated int64" : ", shaderInt64") +
+          (slm_state ? ", fold state in SLM" : "") + ")";
+    ok.store(true, std::memory_order_relaxed);
     return true;
 }
 
@@ -497,12 +791,14 @@ void GpuEvaluator::Impl::destroy() {
 // ---------------------------------------------------------------- public
 
 GpuEvaluator::GpuEvaluator() : m_impl(new Impl) {
-    if (!m_impl->init()) m_impl->ok = false;
+    if (!m_impl->init()) m_impl->ok.store(false, std::memory_order_relaxed);
 }
 
 GpuEvaluator::~GpuEvaluator() { m_impl->destroy(); }
 
-bool GpuEvaluator::available() const { return m_impl->ok; }
+bool GpuEvaluator::available() const {
+    return m_impl->ok.load(std::memory_order_relaxed);
+}
 void GpuEvaluator::set_min_batch(size_t n) {
     m_impl->min_batch.store(n, std::memory_order_relaxed);
 }
@@ -510,6 +806,8 @@ size_t GpuEvaluator::min_batch() const {
     return m_impl->min_batch.load(std::memory_order_relaxed);
 }
 void GpuEvaluator::set_slots(int n) {
+    // 0 = auto: leave whatever init() derived from the device.
+    if (n == 0) return;
     m_impl->nslot.store(n < 1 ? 1 : (n > Impl::NSLOT ? Impl::NSLOT : n),
                         std::memory_order_relaxed);
 }
@@ -517,22 +815,53 @@ int GpuEvaluator::slots() const {
     return m_impl->nslot.load(std::memory_order_relaxed);
 }
 void GpuEvaluator::set_duty(int pct) {
-    m_impl->duty.store(pct < 1 ? 1 : (pct > 100 ? 100 : pct),
+    // 0 stays 0: it selects the adaptive throttle rather than a pinned share.
+    m_impl->duty.store(pct <= 0 ? 0 : (pct > 100 ? 100 : pct),
                        std::memory_order_relaxed);
 }
 int GpuEvaluator::duty() const {
     return m_impl->duty.load(std::memory_order_relaxed);
+}
+bool GpuEvaluator::gave_up() const {
+    return m_impl->gave_up.load(std::memory_order_relaxed);
+}
+void GpuEvaluator::note_cpu(uint64_t macs, double seconds) {
+    Impl& I = *m_impl;
+    // Recorded even when the share is pinned, and only *consulted* when it is
+    // not. Measuring under a pinned duty is how the throttle itself gets A/B'd:
+    // with duty 100 the device is saturated and with duty 1 it is idle, so the
+    // difference in this rate is the interference the device inflicts on the CPU
+    // pool -- which the per-batch rule cannot otherwise see.
+    if (!macs || !(seconds > 0.0)) return;
+    I.ema(I.cpu_rate, I.cpu_samples, (double)macs / seconds);
+}
+void GpuEvaluator::throttle_stats(double* gpu_mps, double* cpu_mps,
+                                  double* accept) const {
+    const Impl& I = *m_impl;
+    if (gpu_mps) *gpu_mps = Impl::rd(I.gpu_rate);
+    if (cpu_mps) *cpu_mps = Impl::rd(I.cpu_rate);
+    if (accept) {
+        const uint64_t o = I.offers.load(std::memory_order_relaxed);
+        const uint64_t t = I.taken.load(std::memory_order_relaxed);
+        *accept = o ? (double)t / (double)o : 0.0;
+    }
 }
 uint64_t GpuEvaluator::macs() const {
     return m_impl->n_macs.load(std::memory_order_relaxed);
 }
 bool GpuEvaluator::would_accept() const {
     Impl& I = *m_impl;
-    if (!I.ok) return false;
+    if (!I.ok.load(std::memory_order_relaxed)) return false;
     const int nsl = I.nslot.load(std::memory_order_relaxed);
-    for (int i = 0; i < nsl; ++i)
-        if (!I.slots[i].busy.load(std::memory_order_relaxed)) return true;
-    return false;
+    bool slot = false;
+    for (int i = 0; i < nsl && !slot; ++i)
+        if (!I.slots[i].busy.load(std::memory_order_relaxed)) slot = true;
+    if (!slot) return false;
+    // Ask the throttle only once a slot is actually free, so a busy device does
+    // not burn offers -- the counters drive the warm-up alternation and the
+    // re-probe interval, and inflating them with slot contention would make both
+    // fire at the wrong rate.
+    return I.throttle_ok();
 }
 void GpuEvaluator::set_partition_cap(int p) {
     m_impl->pcap.store(p < 1 ? 1 : (p > 8 ? 8 : p), std::memory_order_relaxed);
@@ -555,16 +884,17 @@ bool GpuEvaluator::evaluate(const int32_t* shifted, uint32_t bsize,
                             const std::vector<Candidate>& cands,
                             std::vector<uint32_t>& out_costs) {
     Impl& I = *m_impl;
-    if (!I.ok || cands.empty()) return false;
+    if (!I.ok.load(std::memory_order_relaxed) || cands.empty()) return false;
     // The kernel walks the block in fixed 32-sample chunks.
     if (bsize % 32u != 0u) return false;
     if (cands.size() < I.min_batch.load(std::memory_order_relaxed)) return false;
 
-    const int dty = I.duty.load(std::memory_order_relaxed);
-    if (dty < 100) {
-        const uint64_t n = I.offers.fetch_add(1, std::memory_order_relaxed);
-        if ((int)((n * 100) % 10000 / 100) >= dty) return false;
-    }
+    // Work this batch represents, in the same unit both throughput rates use.
+    // The throttle itself ran in would_accept(), before the caller paid to build
+    // this batch; see the note on Impl::throttle_ok.
+    uint64_t macs = 0;
+    for (const auto& cd : cands)
+        macs += (uint64_t)(bsize - (uint32_t)cd.order) * (uint64_t)cd.order;
 
     // Claim a slot. Failing is not an error: the caller encodes on the CPU
     // instead, and both paths produce the same winner, so the output is
@@ -616,18 +946,22 @@ bool GpuEvaluator::evaluate(const int32_t* shifted, uint32_t bsize,
     const uint32_t cpw    = Impl::WG / 32;               // candidates per group
     const uint32_t groups = ((uint32_t)cands.size() + cpw - 1) / cpw;
 
-    if (vkResetCommandBuffer(sl.cmd, 0) != VK_SUCCESS) return false;
+    VkResult vr;
+    if ((vr = vkResetCommandBuffer(sl.cmd, 0)) != VK_SUCCESS)
+        return I.fail_device(vr, "vkResetCommandBuffer");
     VkCommandBufferBeginInfo bi{};
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (vkBeginCommandBuffer(sl.cmd, &bi) != VK_SUCCESS) return false;
+    if ((vr = vkBeginCommandBuffer(sl.cmd, &bi)) != VK_SUCCESS)
+        return I.fail_device(vr, "vkBeginCommandBuffer");
     vkCmdBindPipeline(sl.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, I.pipe);
     vkCmdBindDescriptorSets(sl.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, I.plo, 0, 1,
                             &sl.dset, 0, nullptr);
     vkCmdPushConstants(sl.cmd, I.plo, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        sizeof pcv, &pcv);
     vkCmdDispatch(sl.cmd, groups, 1, 1);
-    if (vkEndCommandBuffer(sl.cmd) != VK_SUCCESS) return false;
+    if ((vr = vkEndCommandBuffer(sl.cmd)) != VK_SUCCESS)
+        return I.fail_device(vr, "vkEndCommandBuffer");
 
     // Only the submit is serialised -- a VkQueue is externally synchronised,
     // but waiting is per-fence and must stay outside the lock or the device is
@@ -639,10 +973,16 @@ bool GpuEvaluator::evaluate(const int32_t* shifted, uint32_t bsize,
         si2.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         si2.commandBufferCount = 1;
         si2.pCommandBuffers = &sl.cmd;
-        if (vkQueueSubmit(I.queue, 1, &si2, sl.fence) != VK_SUCCESS) return false;
+        if ((vr = vkQueueSubmit(I.queue, 1, &si2, sl.fence)) != VK_SUCCESS)
+            return I.fail_device(vr, "vkQueueSubmit");
     }
-    if (vkWaitForFences(I.dev, 1, &sl.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
-        return false;
+    // A lost device shows up here in practice: measured on a host that suspended
+    // to S3 mid-encode, this wait never returned and the process ignored SIGKILL
+    // while stuck in the driver. A finite timeout cannot fix that case -- the
+    // driver never came back -- but every failure mode it *does* report has to
+    // take the path down rather than silently reroute batch after batch.
+    if ((vr = vkWaitForFences(I.dev, 1, &sl.fence, VK_TRUE, UINT64_MAX)) != VK_SUCCESS)
+        return I.fail_device(vr, "vkWaitForFences");
 
     out_costs.resize(cands.size());
     std::memcpy(out_costs.data(), sl.bCosts.map, (size_t)needO);
@@ -680,11 +1020,16 @@ bool GpuEvaluator::evaluate(const int32_t* shifted, uint32_t bsize,
     uint64_t last = I.t_last.load(std::memory_order_relaxed);
     while (us1 > last &&
            !I.t_last.compare_exchange_weak(last, us1, std::memory_order_relaxed)) {}
-    uint64_t macs = 0;
-    for (const auto& cd : cands)
-        macs += (uint64_t)(bsize - (uint32_t)cd.order) * (uint64_t)cd.order;
     I.n_macs.fetch_add(macs, std::memory_order_relaxed);
     I.n_cands.fetch_add(cands.size(), std::memory_order_relaxed);
+    I.taken.fetch_add(1, std::memory_order_relaxed);
+
+    // Throughput sample for the throttle. This is the whole call as the calling
+    // worker experiences it -- submit, fence wait, readback -- which is the cost
+    // the comparison against one CPU thread has to be made against, not the
+    // device's own execution time.
+    const double secs = std::chrono::duration<double>(t1 - t0).count();
+    if (secs > 0.0) I.ema(I.gpu_rate, I.gpu_samples, (double)macs / secs);
     return true;
 }
 

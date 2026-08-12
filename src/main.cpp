@@ -81,9 +81,19 @@ static void print_usage(const char* prog) {
         << "                       measured fastest here). Raise it if a device\n"
         << "                       has a long submit path; small batches then\n"
         << "                       stay on the CPU.\n"
-        << "      --gpu-slots N      Dispatches in flight (1-16, default 3).\n"
-        << "                       Each parks a worker on a fence, so more is\n"
-        << "                       not better unless the GPU outruns the CPU.\n"
+        << "      --gpu-slots N      Dispatches in flight (1-16). Default is\n"
+        << "                       auto: 3 normally, 1 on a device running the\n"
+        << "                       compat kernel. Each parks a worker on a\n"
+        << "                       fence, so more is not better unless the GPU\n"
+        << "                       outruns the CPU -- on an old iGPU 3 slots\n"
+        << "                       cost 3.7x against 1.\n"
+        << "      --gpu-duty N       Percent of offered subframes the GPU takes\n"
+        << "                       (1-100), or 0 = adaptive, the default: the\n"
+        << "                       device's measured throughput is compared\n"
+        << "                       against one CPU thread's and it takes work\n"
+        << "                       only while it is winning. Pin it to A/B the\n"
+        << "                       throttle itself; no fixed share is right on\n"
+        << "                       every device, or even at every bit depth.\n"
         << "      --gpu-partition-cap N\n"
         << "                       Cap the GPU's partition-order search (1-8).\n"
         << "                       8 (default) reproduces the CPU exactly. Lower\n"
@@ -407,10 +417,10 @@ int main(int argc, char* argv[]) {
             ++i;
             try {
                 unsigned v = static_cast<unsigned>(std::stoul(argv[i]));
-                if (v < 1 || v > 100) throw std::invalid_argument("range");
-                cfg.gpu_duty = v;
+                if (v > 100) throw std::invalid_argument("range");
+                cfg.gpu_duty = v;   // 0 = adaptive
             } catch (const std::exception&) {
-                std::cerr << "Error: --gpu-duty takes 1-100, got '" << argv[i] << "'.\n";
+                std::cerr << "Error: --gpu-duty takes 0-100, got '" << argv[i] << "'.\n";
                 return EXIT_FAILURE;
             }
 
