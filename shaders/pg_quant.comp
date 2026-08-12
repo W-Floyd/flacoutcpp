@@ -23,6 +23,24 @@
 // cost rather than needing a validity flag -- the sweep still prices them, which
 // is wasted work but not wrong work.
 
+// Timing-only ablation (deliberately wrong ranking, so wrong output): drop the
+// log2 out of the order-shortlist scoring, to separate "this loop is 32-way
+// redundant" from "this device is slow at transcendentals".
+#ifndef PG_QUANT_NOLOG
+#define PG_QUANT_NOLOG 0
+#endif
+// Second timing-only ablation: keep every computation but collapse the 40-dword
+// per-candidate store to one dword, to test whether this kernel is bound by its
+// scattered writes (lane-adjacent candidates are CSTRIDE*4 = 160 bytes apart).
+#ifndef PG_QUANT_NOSTORE
+#define PG_QUANT_NOSTORE 0
+#endif
+#if PG_QUANT_NOLOG
+#define SCORE_LOG(x) (x)
+#else
+#define SCORE_LOG(x) log2(x)
+#endif
+
 #define MAXO 32
 #define CSTRIDE 40
 #define INVALID_HDR 0x10000000
@@ -113,13 +131,13 @@ void main() {
         cand[co + 36] = 0;
         return;
     }
-    const float myScore = 0.5 * float(pc.bsize) * log2(myErr)
+    const float myScore = 0.5 * float(pc.bsize) * SCORE_LOG(myErr)
                         + float(ord) * float(prec + effBps);
     int better = 0;
     for (int o = 1; o <= MAXO; ++o) {
         const float oe = err[eb + o];
         if (oe <= 0.0) continue;
-        const float sc2 = 0.5 * float(pc.bsize) * log2(oe)
+        const float sc2 = 0.5 * float(pc.bsize) * SCORE_LOG(oe)
                         + float(o) * float(prec + effBps);
         // Ties break toward the lower order, so the shortlist is deterministic.
         if (sc2 < myScore || (sc2 == myScore && o < ord)) ++better;
@@ -173,6 +191,18 @@ void main() {
     // feedback is doing real work.
     const float sc = (shift >= 0) ? float(1 << shift) : 1.0 / float(1 << (-shift));
     float acc = 0.0;
+#if PG_QUANT_NOSTORE
+    int qsum = 0, qabs = 0;
+    for (int j = 0; j < ord; ++j) {
+        acc += lpcf[lb + j] * sc;
+        float q = (acc >= 0.0) ? floor(acc + 0.5) : ceil(acc - 0.5);
+        int qi = int(clamp(q, float(qmin), float(qmax)));
+        acc -= float(qi);
+        qsum ^= qi; qabs += abs(qi);
+    }
+    cand[co + 4] = qsum;
+    const int sumAbs = qabs;
+#else
     for (int j = 0; j < ord; ++j) {
         acc += lpcf[lb + j] * sc;
         // std::lround is half-away-from-zero; GLSL round() is allowed to pick
@@ -183,6 +213,7 @@ void main() {
         cand[co + 4 + j] = qi;
     }
     for (int j = ord; j < MAXO; ++j) cand[co + 4 + j] = 0;
+#endif
 
     // Can the sweep accumulate this candidate's dot product in 32 bits?
     //
@@ -195,8 +226,10 @@ void main() {
     // integer ALU, so int64 on Apple silicon is synthesised from 32-bit ops.
     // This is exact, not approximate -- nothing about the chosen candidate or
     // the emitted bits changes.
+#if !PG_QUANT_NOSTORE
     int sumAbs = 0;
     for (int j = 0; j < ord; ++j) sumAbs += abs(cand[co + 4 + j]);
+#endif
     cand[co + 36] = (effBps >= 1 && effBps <= 31 &&
                      sumAbs <= (0x7FFFFFFF >> (effBps - 1))) ? 1 : 0;
 

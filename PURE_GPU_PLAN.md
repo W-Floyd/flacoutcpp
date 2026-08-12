@@ -862,6 +862,43 @@ That is a much better lead than the width rewrite, and it is the opposite
 conclusion from the FP32RANK note above -- which was measured on Apple, where the
 arithmetic is not the bottleneck and int32 is free. Per-device, not universal.
 
+### What is left on Intel, and it is small
+
+Per-stage Intel/Apple ratios on the same default (10x2, MLKDream), which is the
+only way to see which kernels are slow *for that device* rather than slow because
+the device is slow. The baseline is ~13-16x for the integer-heavy kernels and
+~4x for the fp32-heavy ones (`levinson` 4.1x, `crc` 3.1x), exactly as the
+int32-multiply finding above predicts:
+
+| stage | Apple | Arc | ratio | |
+|---|---:|---:|---:|---|
+| sweep | 36.7 ms | 563.4 ms | 15.4x | at baseline |
+| autoc | 32.5 ms | 534.5 ms | 16.4x | at baseline |
+| rice | 10.0 ms | 134.7 ms | 13.5x | at baseline |
+| **quant** | **0.7 ms** | **136.2 ms** | **194x** | **anomalous** |
+| prepare | 0.8 ms | 32.9 ms | 41x | anomalous |
+| select | 0.2 ms | 5.8 ms | 29x | anomalous, but 0.4% |
+| pack | 1.3 ms | 25.7 ms | 20x | mildly anomalous |
+| levinson | 13.1 ms | 53.3 ms | 4.1x | fp32 parity |
+
+Bringing all four anomalies to the device's own baseline is worth **~11% of Arc
+device time**, and `pg_quant` alone is ~8% of it. That is the entire remaining
+prize, and **two obvious explanations for it are already refuted** (timing-only
+ablations, `-DFLACOUT_PG_DEFS=-DPG_QUANT_NOLOG=1` / `-DPG_QUANT_NOSTORE=1`):
+
+- *Transcendentals.* The order-shortlist loop calls `log2` 32 times per lane and
+  every one of a solve's 32 order-lanes recomputes the same 32 scores. Removing
+  the `log2`: **136.2 -> 138.2 ms.** Not it.
+- *Scattered stores.* Each lane writes 40 dwords and lane-adjacent candidates are
+  160 bytes apart, so the writes coalesce badly. Collapsing the store to one
+  dword: **136.2 -> 140.7 ms.** Not it either.
+
+What is left to suspect is the uncoalesced `lpcf` reads (lane-adjacent lanes are
+128 bytes apart) or plain latency on the 32-step error-feedback chain at low
+occupancy -- and separating those needs a shader profiler, not timestamps.
+**Bounded at ~8% for that kernel, on a device where `-P` already beats its host's
+CPU path by 5.45x, this is where I would stop.**
+
 **Conclusion: do not build the width-agnostic bit-plane mapping.** Three
 independent measurements say it addresses nothing -- the state it would
 redistribute is width-invariant, cutting that state 40% for real buys 2%, and the
