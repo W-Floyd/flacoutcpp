@@ -69,4 +69,26 @@ gen3 syn3m_tonal.flac     "0.35*sin(2*PI*440*t)+0.25*sin(2*PI*659*t)+0.15*sin(2*
 gen3 syn3m_noise.flac     "0.35*random(0)+0.08*sin(2*PI*440*t)|0.35*random(1)+0.08*sin(2*PI*443*t)"
 gen3 syn3m_transient.flac "0.7*sin(2*PI*880*t)*exp(-25*mod(t\,0.4))+0.02*random(0)|0.7*sin(2*PI*662*t)*exp(-25*mod(t\,0.4))+0.02*random(1)"
 
+# A fixture carrying a SEEKTABLE, which ffmpeg does not write. The encoder
+# rewrites the block partition, so seek points copied through from the input
+# name offsets that land inside our frames rather than at their headers --
+# invisible to both `flac -t` and a bit-exactness diff, so check.sh validates
+# these outputs with check_seektable.py instead.
+#
+# The targets are chosen to be awkward on purpose. metaflac snaps each to a
+# frame start of *this* file (4096-aligned), which our variable 1024-grid
+# partition does not share, so the rebuild has to re-snap every one. The pair
+# at 90000/94000 lands inside a single larger output frame and must collapse to
+# one point, and 900000 is past the end of a 176400-sample stream, so it has to
+# become a trailing placeholder.
+if command -v metaflac >/dev/null; then
+  cp "$OUT/stereo_4s.flac" "$OUT/seek_4s.flac"
+  metaflac --add-seekpoint=1000  --add-seekpoint=5000   --add-seekpoint=90000 \
+           --add-seekpoint=94000 --add-seekpoint=176000 --add-seekpoint=900000 \
+           "$OUT/seek_4s.flac"
+else
+  echo "warning: metaflac not found — skipping seek_4s.flac (check.sh will" \
+       "skip its seek-table cases)" >&2
+fi
+
 ls -l "$OUT"

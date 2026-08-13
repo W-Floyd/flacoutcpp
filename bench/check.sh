@@ -100,11 +100,59 @@ run bs_max   -R    -b 5040,10080,20160,65520          "$FIX/stereo_4s.flac"
 run ru_he           "$FIX/stereo_4s.flac"
 run ru_ex -e -c 8   "$FIX/stereo_1s.flac"
 run ru_24 -e -c 8   "$FIX/s24_2s.flac"
+# SEEKTABLE rebuild. The input's seek points name the input's partition, and
+# this encoder rewrites it, so copying them through yields offsets that land
+# inside our frames. Neither `flac -t` (which never seeks) nor `cmp` can see
+# that, hence the separate validation pass below. Three partitions of the same
+# audio, so the rebuild has to re-snap the points three different ways.
+if [ -f "$FIX/seek_4s.flac" ]; then
+  run sk_he                       "$FIX/seek_4s.flac"
+  run sk_ex    -e -c 8            "$FIX/seek_4s.flac"
+  run sk_bs -R -b 1024,2048,4096  "$FIX/seek_4s.flac"
+fi
 
 fail=0
 for f in "$OUT"/*.flac; do
   flac -t -s "$f" 2>/dev/null || { echo "  INVALID  $(basename "$f") — does not decode"; fail=1; }
 done
+
+# --- Seek tables: do the points name real frames? ----
+# Structural check, over every output that carries a table (most do not).
+if command -v python3 >/dev/null 2>&1; then
+  tables=0
+  for f in "$OUT"/*.flac; do
+    python3 "$HERE/check_seektable.py" "$f"
+    case $? in
+      0)  tables=$((tables + 1)) ;;
+      77) ;;                       # no SEEKTABLE here, nothing to validate
+      1)  tables=$((tables + 1)); fail=1 ;;   # present but wrong: still covered
+      *)  fail=1 ;;
+    esac
+  done
+  # A fixture that lost its table would make this pass by testing nothing.
+  if [ -f "$FIX/seek_4s.flac" ] && [ "$tables" -eq 0 ]; then
+    echo "  INVALID  no output carried a SEEKTABLE — seek coverage is vacuous"
+    fail=1
+  fi
+else
+  echo "  SKIP      python3 not found — seek tables unchecked"
+fi
+
+# Behavioural check: drive libFLAC's own seek through the rebuilt table and
+# confirm it lands where the same seek into the fixture does. A table can parse
+# cleanly and still misdirect, and this is what a player would actually hit.
+if [ -f "$FIX/seek_4s.flac" ]; then
+  for c in sk_he sk_ex sk_bs; do
+    [ -f "$OUT/$c.flac" ] || continue
+    for range in 0:4096 92160:96256 172032:176400; do
+      from=${range%%:*}; to=${range##*:}
+      cmp -s <(flac -d -s --skip="$from" --until="$to" -c "$FIX/seek_4s.flac" 2>/dev/null) \
+             <(flac -d -s --skip="$from" --until="$to" -c "$OUT/$c.flac"      2>/dev/null) \
+        || { echo "  INVALID  $c.flac — seek to $from..$to decodes differently than the input"
+             fail=1; }
+    done
+  done
+fi
 
 if [ "$MODE" = record ]; then
   [ $fail -eq 0 ] || { echo "refusing to record a reference that does not decode"; exit 1; }
