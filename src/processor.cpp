@@ -127,6 +127,91 @@ static std::string vendor_from_blocks(
     return {};
 }
 
+// ------------------------------------------------------------
+// SEEKTABLE (block type 3)
+//
+// The input's seek points describe the *input's* partition, and this encoder
+// rewrites the stream with a different one -- so copying the block through
+// verbatim ships offsets that point into the middle of our frames. libFLAC's
+// own seek fails outright on such a file, and a player that trusts it lands in
+// the wrong place. The block is therefore rebuilt from the frames actually
+// emitted, in place: it keeps its size, so it can be patched after the audio
+// is written the same way STREAMINFO is.
+//
+// A seek point is 18 bytes, all big-endian: target sample number (8), byte
+// offset of that frame's header from the first frame header (8), and the
+// frame's sample count (2). Sample number 0xFFFF'FFFF'FFFF'FFFF marks a
+// placeholder point, which the format allows and requires to sort last.
+// ------------------------------------------------------------
+namespace {
+
+constexpr size_t SEEKPOINT_BYTES = 18;
+constexpr uint64_t SEEKPOINT_PLACEHOLDER = ~(uint64_t)0;
+
+struct EmittedFrame {
+    uint64_t first_sample;
+    uint64_t offset;      // from the first byte of the first frame header
+    uint32_t block_size;
+};
+
+uint64_t rd_be64(const uint8_t* p) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) v = (v << 8) | p[i];
+    return v;
+}
+void wr_be(uint8_t* p, uint64_t v, int n) {
+    for (int i = n - 1; i >= 0; --i) { p[i] = (uint8_t)(v & 0xFFu); v >>= 8; }
+}
+void wr_placeholder(uint8_t* p) {
+    wr_be(p, SEEKPOINT_PLACEHOLDER, 8);
+    wr_be(p + 8, 0, 8);
+    wr_be(p + 16, 0, 2);
+}
+
+/// Rewrite `payload` (a SEEKTABLE block's payload, header excluded) so every
+/// point names a frame in `frames`. Each surviving input target is snapped to
+/// the frame containing it; targets that collapse onto the same frame merge,
+/// since two points may not name one frame, and the freed slots become
+/// placeholders. Point count -- and therefore block size -- never changes.
+void rebuild_seektable(std::vector<uint8_t>& payload,
+                       const std::vector<EmittedFrame>& frames)
+{
+    const size_t n = payload.size() / SEEKPOINT_BYTES;
+
+    // Map each real input target onto the frame that contains it.
+    std::vector<size_t> hits;
+    hits.reserve(n);
+    if (!frames.empty()) {
+        for (size_t i = 0; i < n; ++i) {
+            const uint64_t want = rd_be64(&payload[i * SEEKPOINT_BYTES]);
+            if (want == SEEKPOINT_PLACEHOLDER) continue;
+            const auto it = std::upper_bound(
+                frames.begin(), frames.end(), want,
+                [](uint64_t s, const EmittedFrame& f) { return s < f.first_sample; });
+            if (it == frames.begin()) continue;             // before the stream
+            const size_t k = (size_t)(it - frames.begin()) - 1;
+            if (want >= frames[k].first_sample + frames[k].block_size) continue;  // past the end
+            hits.push_back(k);
+        }
+        std::sort(hits.begin(), hits.end());
+        hits.erase(std::unique(hits.begin(), hits.end()), hits.end());
+    }
+
+    for (size_t i = 0; i < n; ++i) {
+        uint8_t* p = &payload[i * SEEKPOINT_BYTES];
+        if (i < hits.size()) {
+            const EmittedFrame& f = frames[hits[i]];
+            wr_be(p, f.first_sample, 8);
+            wr_be(p + 8, f.offset, 8);
+            wr_be(p + 16, f.block_size, 2);
+        } else {
+            wr_placeholder(p);
+        }
+    }
+}
+
+}  // namespace
+
 // ============================================================
 // Main pipeline
 // ============================================================
@@ -363,16 +448,26 @@ bool Processor::process() {
     out.write(reinterpret_cast<const char*>(si_block.data()),
               (std::streamsize)si_block.size());
 
-    // Extra metadata blocks
+    // Extra metadata blocks. A SEEKTABLE among them is written out as-is here
+    // and patched once the frames it must describe exist; note where its
+    // payload landed. Only the first is rebuilt — the format permits one.
+    std::streamoff       seektable_at = -1;
+    std::vector<uint8_t> seektable_pts;
     for (size_t i = 0; i < extra_blocks.size(); ++i) {
         bool is_last = (i == extra_blocks.size() - 1);
         auto& blk = extra_blocks[i];
         // Set/clear the is_last bit in the stored header byte
         if (is_last) blk[0] |= 0x80u;
         else         blk[0] &= 0x7Fu;
+        if ((blk[0] & 0x7Fu) == 3u && blk.size() > 4 && seektable_at < 0) {
+            seektable_at = (std::streamoff)out.tellp() + 4;   // skip the block header
+            seektable_pts.assign(blk.begin() + 4, blk.end());
+        }
         out.write(reinterpret_cast<const char*>(blk.data()),
                   (std::streamsize)blk.size());
     }
+    const bool want_seektable = seektable_at >= 0
+                             && seektable_pts.size() >= SEEKPOINT_BYTES;
 
     // --- Step 5: encode and write frames ----
     FrameWriter fw;
@@ -384,8 +479,15 @@ bool Processor::process() {
     size_t   frames_reused = 0;
     size_t   frames_emitted = 0;
 
+    // Only collected when a SEEKTABLE has to be rebuilt against it.
+    std::vector<EmittedFrame> emitted;
+    uint64_t emit_sample = 0;
+
     auto emit = [&](const std::vector<uint8_t>& fb, uint32_t bs) {
         ++frames_emitted;
+        if (want_seektable)
+            emitted.push_back(EmittedFrame{emit_sample, total_written, bs});
+        emit_sample += bs;
         out.write(reinterpret_cast<const char*>(fb.data()),
                   (std::streamsize)fb.size());
         min_frm = std::min(min_frm, (uint32_t)fb.size());
@@ -486,6 +588,14 @@ bool Processor::process() {
         md5_digest.data());
     // Write only the 34-byte payload (skip the 4-byte block header)
     out.write(reinterpret_cast<const char*>(si_updated.data() + 4), 34);
+
+    // --- Step 6b: rebuild SEEKTABLE against the frames actually emitted ----
+    if (want_seektable) {
+        rebuild_seektable(seektable_pts, emitted);
+        out.seekp(seektable_at, std::ios::beg);
+        out.write(reinterpret_cast<const char*>(seektable_pts.data()),
+                  (std::streamsize)seektable_pts.size());
+    }
 
     out.flush();
     if (!out) {
@@ -1020,6 +1130,18 @@ bool Processor::process_pure_gpu(std::vector<std::vector<uint8_t>>& extra_blocks
         std::cerr << "Error: cannot open output file: " << tmp_output << "\n";
         return false;
     }
+
+    // A copied-through SEEKTABLE describes the input's partition, not ours, and
+    // this path emits fixed pg_block_size frames through a chunk sink that does
+    // not expose per-frame byte offsets -- so unlike process(), it cannot
+    // rebuild the block. Drop it: no seek table beats a wrong one, which
+    // libFLAC's own seek fails on outright.
+    extra_blocks.erase(
+        std::remove_if(extra_blocks.begin(), extra_blocks.end(),
+                       [](const std::vector<uint8_t>& b) {
+                           return !b.empty() && (b[0] & 0x7Fu) == 3u;
+                       }),
+        extra_blocks.end());
 
     out.write("fLaC", 4);
     const bool si_is_last = extra_blocks.empty();
