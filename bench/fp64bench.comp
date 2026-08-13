@@ -1,0 +1,28 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : enable
+// FMA throughput microbenchmark. NACC independent accumulator chains so the
+// measurement is throughput-bound rather than latency-bound, ITER fused
+// multiply-adds each. Compiled twice, once per type, from one source.
+#ifdef USE_FP64
+#define T double
+#define K(x) double(x)
+#else
+#define T float
+#define K(x) float(x)
+#endif
+#define NACC 8
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer Out { float sink[]; };
+layout(push_constant) uniform PC { int iter; } pc;
+void main() {
+    T a[NACC];
+    const T seed = K(1.0) + T(gl_GlobalInvocationID.x & 15u) * K(1e-3);
+    for (int i = 0; i < NACC; ++i) a[i] = seed + T(i);
+    const T m = K(1.0000001), b = K(0.9999999);
+    for (int it = 0; it < pc.iter; ++it)
+        for (int i = 0; i < NACC; ++i) a[i] = a[i] * m + b;
+    T s = K(0.0);
+    for (int i = 0; i < NACC; ++i) s += a[i];
+    // Store so nothing is dead, but only from one lane per group.
+    if (gl_LocalInvocationID.x == 0u) sink[gl_WorkGroupID.x] = float(s);
+}
