@@ -30,11 +30,12 @@ static thread_local uint64_t t_range_hi = UINT64_MAX;
 static thread_local uint64_t t_frame_end = 0;
 
 // Frame-reuse bookkeeping under a *parallel* decode. Each worker records the
-// frames it decodes with their byte ranges; the ranges are merged, sorted and
-// deduplicated once every worker has joined. Boundary frames get decoded by two
-// workers (a seek lands on the frame *containing* the target, and each worker
-// runs until it passes its end), so the duplicates are exact and dropping either
-// copy is the same thing.
+// frames it decodes with their byte ranges; the ranges are merged and sorted
+// once every worker has joined. Ownership of a boundary frame is exactly one
+// worker's: the seeking worker drops the frame the seek landed on (t_skip_rec)
+// and the previous worker decodes one frame past its range to cover it, so the
+// byte offsets chain unbroken across the join. The merge still dedups, as a
+// guard rather than an expected case.
 static thread_local std::vector<Processor::PendingFrameRec> t_frames;
 /// Byte offset just past the previous frame this worker decoded; seeded from the
 /// decoder's position right after the seek.
@@ -42,6 +43,12 @@ static thread_local uint64_t t_prev_end = 0;
 /// Cleared per worker: a position query that fails once makes the whole map
 /// unusable, and the merge must see that.
 static thread_local bool t_pos_ok = true;
+/// Set across a seek. FLAC__stream_decoder_seek_absolute delivers the frame it
+/// lands on through the write callback *before* it returns, which is before
+/// t_prev_end has been seeded -- so that one frame's byte_start is not knowable
+/// here and the record must be dropped. The previous worker supplies it instead;
+/// see the overlap in decode_parallel.
+static thread_local bool t_skip_rec = false;
 
 // ============================================================
 // Constructor / destructor
@@ -252,6 +259,15 @@ bool Processor::process() {
     // frames are also offered to the partitioning DP as exact-cost edges, so
     // the DP can mix the input's partition with its own.
     bool reuse = m_config.reuse_frames && m_frame_pos_ok && !m_input_frames.empty();
+    if (const char* p = std::getenv("FLACOUT_DUMP_FRAMES")) {
+        if (FILE* df = fopen(p, "w")) {
+            for (const auto& x : m_input_frames)
+                fprintf(df, "%llu %u %llu %llu\n", (unsigned long long)x.first_sample,
+                        x.block_size, (unsigned long long)x.byte_start,
+                        (unsigned long long)x.byte_end);
+            fclose(df);
+        }
+    }
     std::vector<uint8_t> input_bytes;
     if (reuse) {
         uint64_t expect = 0;
@@ -625,7 +641,8 @@ void Processor::merge_input_frames(std::vector<std::vector<PendingFrameRec>>& pe
               [](const PendingFrameRec& a, const PendingFrameRec& b) {
                   return a.first_sample < b.first_sample;
               });
-    // Boundary frames are decoded twice, identically; keep one.
+    // Guard: workers are supposed to own boundary frames exclusively, but a
+    // duplicate is harmless as long as only one copy is kept.
     uint64_t expect = 0;
     for (const auto& f : all) {
         if (!m_input_frames.empty() &&
@@ -662,6 +679,7 @@ bool Processor::decode_parallel(FLAC__StreamDecoder* first, unsigned nthr,
             t_frames.clear();
             t_pos_ok = m_config.reuse_frames;
             t_prev_end = 0;
+            t_skip_rec = false;
 
             auto fail = [&]() {
                 m_decode_failed.store(true, std::memory_order_release);
@@ -685,7 +703,12 @@ bool Processor::decode_parallel(FLAC__StreamDecoder* first, unsigned nthr,
                     return;
                 }
                 own = true;
-                if (!FLAC__stream_decoder_seek_absolute(d, lo)) {
+                // The seek hands the landing frame to the write callback before
+                // it returns; that record is the previous worker's to make.
+                t_skip_rec = true;
+                const bool seek_ok = FLAC__stream_decoder_seek_absolute(d, lo);
+                t_skip_rec = false;
+                if (!seek_ok) {
                     FLAC__stream_decoder_delete(d);
                     fail();
                     return;
@@ -697,6 +720,16 @@ bool Processor::decode_parallel(FLAC__StreamDecoder* first, unsigned nthr,
             if (t_pos_ok && !FLAC__stream_decoder_get_decode_position(d, &t_prev_end))
                 t_pos_ok = false;
 
+            // Reuse needs one frame of overlap past the range end. The next
+            // worker seeks to `hi` and cannot record the frame it lands on, so
+            // this worker decodes it: `hi + 1` keeps going through a frame that
+            // ends exactly at the boundary and stops on one that crosses it
+            // (already the next worker's landing frame, hence already covered).
+            // The extra samples are clipped away by range, so only the byte map
+            // grows. Without reuse there is nothing to record and no overlap.
+            const uint64_t cover = (m_config.reuse_frames && hi < m_total_samples)
+                                 ? hi + 1 : hi;
+
             bool ok = true;
             for (;;) {
                 const FLAC__StreamDecoderState st = FLAC__stream_decoder_get_state(d);
@@ -706,7 +739,7 @@ bool Processor::decode_parallel(FLAC__StreamDecoder* first, unsigned nthr,
                     st == FLAC__STREAM_DECODER_SEEK_ERROR ||
                     st == FLAC__STREAM_DECODER_MEMORY_ALLOCATION_ERROR) { ok = false; break; }
                 if (!FLAC__stream_decoder_process_single(d)) { ok = false; break; }
-                if (t_frame_end >= hi) break;
+                if (t_frame_end >= cover) break;
             }
             if (own) FLAC__stream_decoder_delete(d);
             if (!ok) m_decode_failed.store(true, std::memory_order_release);
@@ -1110,7 +1143,15 @@ FLAC__StreamDecoderWriteStatus Processor::write_callback(
         // Reuse needs every input frame's byte range. Recorded per worker and
         // merged after the join -- unlike the sample data, this cannot be placed
         // by position, because the byte offsets only chain within one decoder.
-        if (self->m_config.reuse_frames && t_pos_ok) {
+        if (t_skip_rec) {
+            // Delivered by the seek, not by this worker's decode loop. Its
+            // byte_start would be a stale t_prev_end, and at a mid-frame landing
+            // its header is a synthetic partial (libFLAC shifts off the samples
+            // before the target and shortens blocksize to match), which is not a
+            // frame that exists in the file at all. Either way the previous
+            // worker records this frame properly.
+            t_skip_rec = false;
+        } else if (self->m_config.reuse_frames && t_pos_ok) {
             uint64_t end = 0;
             if (FLAC__stream_decoder_get_decode_position(decoder, &end)) {
                 t_frames.push_back(Processor::PendingFrameRec{at, bsize, t_prev_end, end});
