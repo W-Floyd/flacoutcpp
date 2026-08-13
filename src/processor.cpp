@@ -774,6 +774,7 @@ bool Processor::decode_parallel(FLAC__StreamDecoder* first, unsigned nthr,
 {
     m_range_len = range_len;
     m_range_done.assign(nthr, 0);
+    m_map_frames = m_config.reuse_frames;
 
     std::vector<std::vector<PendingFrameRec>> per_worker(nthr);
     std::vector<uint8_t> pos_ok(nthr, 1);
@@ -1273,7 +1274,7 @@ FLAC__StreamDecoderWriteStatus Processor::write_callback(
             // frame that exists in the file at all. Either way the previous
             // worker records this frame properly.
             t_skip_rec = false;
-        } else if (self->m_config.reuse_frames && t_pos_ok) {
+        } else if (self->m_map_frames && t_pos_ok) {
             uint64_t end = 0;
             if (FLAC__stream_decoder_get_decode_position(decoder, &end)) {
                 t_frames.push_back(Processor::PendingFrameRec{at, bsize, t_prev_end, end});

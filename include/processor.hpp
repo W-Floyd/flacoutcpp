@@ -250,6 +250,11 @@ private:
     // encoder may read anything below what it has acquired. That is the whole
     // synchronisation: no lock on the sample data itself.
     bool                  m_stream_mode = false;
+    /// Whether a streaming decode should record input frames' byte ranges for
+    /// reuse. Only decode_parallel() merges those records, so the -P decode
+    /// leaves this false and skips the per-frame position query and push that
+    /// nothing there would ever read.
+    bool                  m_map_frames = false;
     /// Highest sample count that is complete *contiguously* from zero. With a
     /// parallel decode the ranges finish out of order, so this advances only as a
     /// prefix of them completes -- which is what lets readers keep the simple
